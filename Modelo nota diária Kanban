@@ -1,0 +1,223 @@
+---
+tipo: daily-kanban
+data: {{date:YYYY-MM-DD}}
+---
+
+Nota diária de tarefas e análises.
+
+
+# 🎯 Foco do dia
+
+- 
+- 
+- 
+
+---
+
+# 🧩 Tarefas do dia
+
+## Backlog
+
+- [ ] tarefa
+  [kanban_status::backlog] <!-- backlog | doing | blocked | done -->
+  [kanban_prioridade::media] <!-- alta | media | baixa -->
+  [kanban_due::{{date:YYYY-MM-DD}}] <!-- prazo da tarefa -->
+  
+  [kanban_pedido::] <!-- ID do ticket ou demanda (ex: PED-4213) -->
+  [kanban_macrotarefa::] <!-- iniciativa maior (ex: [[retroacao_carteira]]) -->
+  [kanban_tabela::] <!-- tabela impactada (ex: [[base_contratos]]) -->
+  [kanban_query::] <!-- query relacionada -->
+
+  [kanban_impacto::medio] <!-- alto | medio | baixo -->
+
+  [kanban_motivo::] <!-- motivo do bloqueio -->
+  [kanban_dependencia::] <!-- pessoa / time / base dependente -->
+
+  [kanban_tempo_estimado::] <!-- estimativa (ex: 2h) -->
+  [kanban_tempo_gasto::] <!-- esforço real -->
+
+  [kanban_contexto::] <!-- resumo do problema ou análise -->
+
+  [kanban_tipo::] <!-- analise | bug | documentacao | alinhamento -->
+  [kanban_ambiente::] <!-- prod | dev | homolog -->
+
+  [kanban_mesref::] <!-- mês de referência (ex: 202602) -->
+  [kanban_escritorio::] <!-- escritório de cobrança -->
+  [kanban_contrato::] <!-- contrato específico -->
+
+  [kanban_origem::] <!-- daily | reunião | e-mail | gestor -->
+  
+
+---
+
+## Doing
+
+%%
+- [ ] tarefa em andamento
+  [kanban_status:: doing]
+  [kanban_prioridade:: media]
+  [kanban_due:: {{date:YYYY-MM-DD}}]
+  [kanban_pedido:: ]
+  [kanban_macrotarefa::] 
+  [kanban_tabela:: ]
+  [kanban_query:: ]
+  [kanban_impacto:: medio]
+%%
+---
+
+## Blocked
+
+%%
+- [ ] tarefa bloqueada
+  [kanban_status:: blocked]
+  [kanban_prioridade:: media]
+  [kanban_due:: {{date:YYYY-MM-DD}}]
+  [kanban_pedido:: ]
+  [kanban_macrotarefa::] 
+  [kanban_tabela:: ]
+  [kanban_query:: ]
+  [kanban_impacto:: medio]
+%%
+---
+
+## Done
+
+%%
+- [x] tarefa concluída
+  [kanban_status:: done]
+  [kanban_prioridade:: media]
+  [kanban_due:: {{date:YYYY-MM-DD}}]
+  [kanban_pedido:: ]
+  [kanban_macrotarefa::] 
+  [kanban_tabela:: ]
+  [kanban_query:: ]
+  [kanban_impacto:: medio]
+%%
+---
+
+# 🧠 Anotações rápidas de análise
+
+## Contexto
+
+-
+
+## Querys analisadas
+
+```sql
+-- cole queries aqui
+````
+
+---
+
+## Descobertas
+
+---
+
+## Próximos passos
+
+---
+
+# 📊 Referências
+
+Tabelas utilizadas:
+
+- [[ ]]
+    
+
+Queries importantes:
+
+- [[ ]]
+    
+
+Pipelines relacionados:
+
+- [[ ]]
+    
+
+---
+
+# ⏱ Registro do dia
+
+
+
+| horário | anotação  |
+| ------- | --------- |
+| 09h55   | tal coisa |
+
+---
+
+# 🔎 Observações
+
+```
+
+---
+
+💡 **Como isso funciona no seu sistema Kanban**
+
+Todas as tarefas criadas nessa nota terão campos como:
+
+```
+
+kanban_status::  
+kanban_prioridade::  
+kanban_due::
+
+````
+
+Então o **dashboard Kanban central** pode consultar todas as notas da pasta `Kanban`.
+
+Exemplo de consulta:
+
+```dataview
+TASK
+FROM "Kanban"
+WHERE kanban_status = "doing"
+AND !completed
+````
+
+Ou para backlog:
+
+```dataview
+TASK
+FROM "Kanban"
+WHERE kanban_status = "backlog"
+AND !completed
+```
+
+---
+
+💡 **Sugestão importante para seu fluxo**
+
+Nomeie as notas assim:
+
+```
+Kanban/
+2026-03-10.md
+2026-03-11.md
+2026-03-12.md
+```
+
+Assim o Dataview consegue ordenar facilmente:
+
+```dataview
+TASK
+FROM "Kanban"
+SORT file.name DESC
+```
+
+---
+
+Se quiser, posso também te gerar **uma versão muito mais poderosa desse sistema**, que inclui:
+
+- **Dashboard Kanban completo**
+    
+- **Heatmap de tarefas**
+    
+- **tarefas atrasadas automaticamente**
+    
+- **WIP limit para Doing**
+    
+- **priorização automática**
+    
+
+Isso deixa o Obsidian **parecido com um mini Jira para analistas de dados**.
