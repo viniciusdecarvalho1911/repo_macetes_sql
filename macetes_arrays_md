@@ -1,0 +1,1328 @@
+# Amazon Athena — Arrays na prática
+
+## Cheatsheet instrutivo com exemplos
+
+Este guia é um material **prático e didático** para aprender a usar `ARRAY` no Amazon Athena com foco em execução real de consultas.
+
+A ideia aqui é mostrar:
+
+* como criar arrays
+* como acessar elementos
+* como transformar arrays
+* como explodir arrays em linhas
+* como reagrupar linhas em arrays
+* como usar `ARRAY<ROW(...)>` para guardar históricos
+* como aplicar isso em contratos, atraso, status, escritório e eventos
+
+---
+
+# 1. O que é um array no Athena
+
+No Athena, um `ARRAY` é uma lista ordenada de valores do mesmo tipo.
+
+Exemplos:
+
+```sql
+SELECT ARRAY[1, 2, 3] AS numeros;
+```
+
+```sql
+SELECT ARRAY['A', 'B', 'C'] AS letras;
+```
+
+```sql
+SELECT ARRAY[DATE '2026-01-01', DATE '2026-01-02'] AS datas;
+```
+
+## Quando usar
+
+Use `ARRAY` quando você quiser representar:
+
+* múltiplos valores relacionados a uma mesma linha
+* histórico de uma entidade
+* sequência temporal
+* lista de eventos
+* lista de escritórios por onde um contrato passou
+* lista de status ao longo do tempo
+
+---
+
+# 2. Primeira diferença importante: tabela normal vs array
+
+## Tabela normal
+
+```text
+contrato | dt_ref     | status
+---------+------------+--------
+123      | 2026-01-01 | OK
+123      | 2026-02-01 | ATRASO
+123      | 2026-03-01 | ACORDO
+```
+
+## Mesma informação em array
+
+```text
+contrato | hist_status
+---------+--------------------------------------------------
+123      | [(2026-01-01,'OK'), (2026-02-01,'ATRASO'), ...]
+```
+
+A tabela normal é melhor para:
+
+* filtros simples
+* joins
+* dashboards
+* agregações tradicionais
+
+O array é melhor para:
+
+* trajetória
+* leitura do histórico completo
+* sequências
+* análise comportamental
+
+---
+
+# 3. Como criar arrays simples
+
+## Array literal
+
+```sql
+SELECT ARRAY[10, 20, 30] AS valores;
+```
+
+## Array de strings
+
+```sql
+SELECT ARRAY['boleto', 'pix', 'debito'] AS meios_pagamento;
+```
+
+## Array de datas
+
+```sql
+SELECT ARRAY[
+    DATE '2026-01-01',
+    DATE '2026-01-05',
+    DATE '2026-01-10'
+] AS dias;
+```
+
+## Array vazio tipado
+
+Athena exige tipo em alguns casos.
+
+```sql
+SELECT CAST(ARRAY[] AS ARRAY(INTEGER)) AS arr_vazio;
+```
+
+Outro exemplo:
+
+```sql
+SELECT CAST(ARRAY[] AS ARRAY(VARCHAR)) AS arr_vazio_texto;
+```
+
+---
+
+# 4. Como acessar elementos do array
+
+## Pela posição com `element_at`
+
+```sql
+SELECT element_at(ARRAY[10, 20, 30], 1) AS primeiro;
+```
+
+Resultado esperado:
+
+```text
+10
+```
+
+## Último elemento
+
+```sql
+SELECT element_at(ARRAY[10, 20, 30], -1) AS ultimo;
+```
+
+Resultado:
+
+```text
+30
+```
+
+## Segundo elemento
+
+```sql
+SELECT element_at(ARRAY['A', 'B', 'C'], 2) AS segundo;
+```
+
+Resultado:
+
+```text
+B
+```
+
+## Tamanho com `cardinality`
+
+```sql
+SELECT cardinality(ARRAY['A', 'B', 'C']) AS qtd;
+```
+
+Resultado:
+
+```text
+3
+```
+
+---
+
+# 5. Como verificar se um valor existe no array
+
+## Com `contains`
+
+```sql
+SELECT contains(ARRAY['boleto', 'pix', 'debito'], 'pix') AS tem_pix;
+```
+
+Resultado:
+
+```text
+true
+```
+
+Outro exemplo:
+
+```sql
+SELECT contains(ARRAY[10, 20, 30], 40) AS tem_40;
+```
+
+Resultado:
+
+```text
+false
+```
+
+---
+
+# 6. Como transformar arrays
+
+## Aplicar função em cada elemento com `transform`
+
+```sql
+SELECT transform(
+    ARRAY['a', 'b', 'c'],
+    x -> upper(x)
+) AS arr_maiusculo;
+```
+
+Resultado:
+
+```text
+['A', 'B', 'C']
+```
+
+## Somar 1 em cada número
+
+```sql
+SELECT transform(
+    ARRAY[1, 2, 3],
+    x -> x + 1
+) AS arr_incrementado;
+```
+
+Resultado:
+
+```text
+[2, 3, 4]
+```
+
+## Extrair um campo de um array de rows
+
+Mais à frente vamos criar arrays de `ROW`. Quando isso existir, você poderá fazer algo como:
+
+```sql
+transform(hist_status, x -> x.status)
+```
+
+Isso devolve só os status.
+
+---
+
+# 7. Como filtrar elementos dentro do array
+
+## Com `filter`
+
+```sql
+SELECT filter(
+    ARRAY[1, 2, 3, 4, 5],
+    x -> x > 3
+) AS maiores_que_3;
+```
+
+Resultado:
+
+```text
+[4, 5]
+```
+
+## Filtrar strings específicas
+
+```sql
+SELECT filter(
+    ARRAY['OK', 'ATRASO', 'ACORDO', 'ATRASO'],
+    x -> x = 'ATRASO'
+) AS atrasos;
+```
+
+Resultado:
+
+```text
+['ATRASO', 'ATRASO']
+```
+
+---
+
+# 8. Como remover duplicados
+
+## Com `array_distinct`
+
+```sql
+SELECT array_distinct(
+    ARRAY['A', 'A', 'B', 'B', 'C']
+) AS sem_duplicados;
+```
+
+Resultado:
+
+```text
+['A', 'B', 'C']
+```
+
+Muito útil para responder perguntas como:
+
+* por quantos escritórios o contrato passou?
+* quantos status diferentes ele já teve?
+
+Exemplo:
+
+```sql
+SELECT cardinality(
+    array_distinct(ARRAY['A', 'A', 'B', 'B'])
+) AS qtd_escritorios_distintos;
+```
+
+Resultado:
+
+```text
+2
+```
+
+---
+
+# 9. Como ordenar e juntar arrays
+
+## Ordenar com `array_sort`
+
+```sql
+SELECT array_sort(ARRAY[30, 10, 20]) AS ordenado;
+```
+
+Resultado:
+
+```text
+[10, 20, 30]
+```
+
+## Juntar em string com `array_join`
+
+```sql
+SELECT array_join(
+    ARRAY['OK', 'ATRASO', 'ACORDO'],
+    ' -> '
+) AS jornada;
+```
+
+Resultado:
+
+```text
+OK -> ATRASO -> ACORDO
+```
+
+Isso é ótimo para visualização rápida.
+
+---
+
+# 10. Como explodir um array em linhas
+
+Esse é um dos usos mais importantes.
+
+## `UNNEST`
+
+```sql
+WITH exemplo AS (
+    SELECT ARRAY['A', 'B', 'C'] AS letras
+)
+SELECT letra
+FROM exemplo
+CROSS JOIN UNNEST(letras) AS t(letra);
+```
+
+Resultado:
+
+```text
+A
+B
+C
+```
+
+## Exemplo com contrato
+
+```sql
+WITH exemplo AS (
+    SELECT
+        123 AS contrato,
+        ARRAY['boleto', 'pix', 'debito'] AS meios
+)
+SELECT
+    contrato,
+    meio
+FROM exemplo
+CROSS JOIN UNNEST(meios) AS t(meio);
+```
+
+Resultado:
+
+```text
+123 | boleto
+123 | pix
+123 | debito
+```
+
+## Quando usar `UNNEST`
+
+Use quando você quer transformar uma lista em várias linhas para:
+
+* agrupar
+* contar
+* filtrar
+* fazer joins
+* gerar datasets para gráfico
+
+---
+
+# 11. Como transformar linhas em array
+
+Agora o caminho inverso.
+
+## `array_agg`
+
+Imagine uma tabela:
+
+```text
+contrato | status
+---------+--------
+123      | OK
+123      | ATRASO
+123      | ACORDO
+```
+
+Você pode fazer:
+
+```sql
+SELECT
+    contrato,
+    array_agg(status) AS hist_status
+FROM tabela_exemplo
+GROUP BY contrato;
+```
+
+Resultado:
+
+```text
+123 | ['OK', 'ATRASO', 'ACORDO']
+```
+
+## Importante: ordenar dentro do `array_agg`
+
+Sem ordenação, o histórico pode vir em ordem errada.
+
+Sempre que for série temporal, use:
+
+```sql
+array_agg(status ORDER BY dt_ref)
+```
+
+Exemplo:
+
+```sql
+SELECT
+    contrato,
+    array_agg(status ORDER BY dt_ref) AS hist_status
+FROM tabela_exemplo
+GROUP BY contrato;
+```
+
+---
+
+# 12. Como criar arrays de estruturas com `ROW`
+
+Aqui começa a parte mais poderosa.
+
+## Por que usar `ROW`
+
+Um array simples como:
+
+```text
+['OK', 'ATRASO', 'ACORDO']
+```
+
+guarda só os valores.
+
+Mas quase sempre você quer guardar mais de um campo por ponto da história, por exemplo:
+
+* data
+* mês
+* valor
+* status
+* resolução
+
+Para isso usamos:
+
+```text
+ARRAY<ROW(...)>
+```
+
+## Criando um `ROW`
+
+```sql
+SELECT CAST(
+    ROW(DATE '2026-01-01', 'OK')
+    AS ROW(dt_ref DATE, status VARCHAR)
+) AS item;
+```
+
+## Criando array de rows
+
+```sql
+SELECT ARRAY[
+    CAST(
+        ROW(DATE '2026-01-01', 'OK')
+        AS ROW(dt_ref DATE, status VARCHAR)
+    ),
+    CAST(
+        ROW(DATE '2026-02-01', 'ATRASO')
+        AS ROW(dt_ref DATE, status VARCHAR)
+    )
+] AS hist_status;
+```
+
+Resultado conceitual:
+
+```text
+[(2026-01-01, OK), (2026-02-01, ATRASO)]
+```
+
+---
+
+# 13. Como acessar campos dentro de `ROW`
+
+Suponha que você tenha um array de rows chamado `hist_status`.
+
+## Explodir e acessar campo
+
+```sql
+WITH exemplo AS (
+    SELECT ARRAY[
+        CAST(ROW(DATE '2026-01-01', 'OK')
+            AS ROW(dt_ref DATE, status VARCHAR)),
+        CAST(ROW(DATE '2026-02-01', 'ATRASO')
+            AS ROW(dt_ref DATE, status VARCHAR))
+    ] AS hist_status
+)
+SELECT
+    x.dt_ref,
+    x.status
+FROM exemplo
+CROSS JOIN UNNEST(hist_status) AS t(x);
+```
+
+Resultado:
+
+```text
+2026-01-01 | OK
+2026-02-01 | ATRASO
+```
+
+## Pegar último status
+
+```sql
+WITH exemplo AS (
+    SELECT ARRAY[
+        CAST(ROW(DATE '2026-01-01', 'OK')
+            AS ROW(dt_ref DATE, status VARCHAR)),
+        CAST(ROW(DATE '2026-02-01', 'ATRASO')
+            AS ROW(dt_ref DATE, status VARCHAR))
+    ] AS hist_status
+)
+SELECT
+    element_at(hist_status, -1).status AS status_atual
+FROM exemplo;
+```
+
+Resultado:
+
+```text
+ATRASO
+```
+
+---
+
+# 14. Como montar histórico de status por contrato
+
+Agora um caso real.
+
+Suponha a base:
+
+```text
+contrato | anomesdia | status
+---------+-----------+--------
+123      | 20260101  | OK
+123      | 20260201  | ATRASO
+123      | 20260301  | ACORDO
+```
+
+## Query
+
+```sql
+WITH base AS (
+    SELECT
+        contrato,
+        cast(date_parse(cast(anomesdia AS varchar), '%Y%m%d') AS date) AS dt_ref,
+        status
+    FROM origem
+)
+SELECT
+    contrato,
+    array_agg(
+        CAST(
+            ROW(dt_ref, status)
+            AS ROW(dt_ref DATE, status VARCHAR)
+        )
+        ORDER BY dt_ref
+    ) AS hist_status
+FROM base
+GROUP BY contrato;
+```
+
+## Resultado conceitual
+
+```text
+123 | [(2026-01-01, OK), (2026-02-01, ATRASO), (2026-03-01, ACORDO)]
+```
+
+---
+
+# 15. Como montar histórico mensal de atraso
+
+Agora algo mais próximo do seu caso.
+
+## Objetivo
+
+Para cada contrato, guardar por mês:
+
+* `mesref`
+* data do primeiro atraso
+* data do último atraso
+* atraso máximo
+* quantidade de dias com atraso
+* resolução do mês
+
+## Base diária
+
+Suponha:
+
+```text
+contrato | anomesdia | dt_atraso | status
+---------+-----------+-----------+---------
+123      | 20260101  | 0         | OK
+123      | 20260110  | 5         | ATRASO
+123      | 20260120  | 16        | ATRASO
+123      | 20260125  | 0         | OK
+123      | 20260210  | 10        | ATRASO
+123      | 20260220  | 45        | RENEGOCIADO
+```
+
+## Passo 1 — normalizar datas e mesref
+
+```sql
+WITH base AS (
+    SELECT
+        contrato,
+        substr(cast(anomesdia AS varchar), 1, 6) AS mesref,
+        cast(date_parse(cast(anomesdia AS varchar), '%Y%m%d') AS date) AS dt_ref,
+        cast(dt_atraso AS integer) AS dt_atraso,
+        cast(status AS varchar) AS status
+    FROM origem
+)
+SELECT *
+FROM base;
+```
+
+## Passo 2 — resumir por contrato e mês
+
+```sql
+WITH base AS (
+    SELECT
+        contrato,
+        substr(cast(anomesdia AS varchar), 1, 6) AS mesref,
+        cast(date_parse(cast(anomesdia AS varchar), '%Y%m%d') AS date) AS dt_ref,
+        cast(dt_atraso AS integer) AS dt_atraso,
+        cast(status AS varchar) AS status
+    FROM origem
+),
+resumo_mes AS (
+    SELECT
+        contrato,
+        mesref,
+        min(CASE WHEN coalesce(dt_atraso, 0) > 0 THEN dt_ref END) AS dt_primeiro_atraso,
+        max(CASE WHEN coalesce(dt_atraso, 0) > 0 THEN dt_ref END) AS dt_ultimo_atraso,
+        max(CASE WHEN coalesce(dt_atraso, 0) > 0 THEN dt_atraso END) AS atraso_max,
+        count_if(coalesce(dt_atraso, 0) > 0) AS dias_em_atraso,
+        max_by(
+            CASE
+                WHEN coalesce(status, '') IN ('ACORDO', 'RENEGOCIADO') THEN 'RENEGOCIADO'
+                WHEN coalesce(dt_atraso, 0) = 0 THEN 'COLOCADO_EM_DIA'
+                WHEN coalesce(dt_atraso, 0) > 0 THEN 'EM_ABERTO'
+                ELSE NULL
+            END,
+            dt_ref
+        ) AS resolucao_mes
+    FROM base
+    GROUP BY 1, 2
+)
+SELECT *
+FROM resumo_mes;
+```
+
+## Passo 3 — montar `hist_atraso`
+
+```sql
+WITH base AS (
+    SELECT
+        contrato,
+        substr(cast(anomesdia AS varchar), 1, 6) AS mesref,
+        cast(date_parse(cast(anomesdia AS varchar), '%Y%m%d') AS date) AS dt_ref,
+        cast(dt_atraso AS integer) AS dt_atraso,
+        cast(status AS varchar) AS status
+    FROM origem
+),
+resumo_mes AS (
+    SELECT
+        contrato,
+        mesref,
+        min(CASE WHEN coalesce(dt_atraso, 0) > 0 THEN dt_ref END) AS dt_primeiro_atraso,
+        max(CASE WHEN coalesce(dt_atraso, 0) > 0 THEN dt_ref END) AS dt_ultimo_atraso,
+        max(CASE WHEN coalesce(dt_atraso, 0) > 0 THEN dt_atraso END) AS atraso_max,
+        count_if(coalesce(dt_atraso, 0) > 0) AS dias_em_atraso,
+        max_by(
+            CASE
+                WHEN coalesce(status, '') IN ('ACORDO', 'RENEGOCIADO') THEN 'RENEGOCIADO'
+                WHEN coalesce(dt_atraso, 0) = 0 THEN 'COLOCADO_EM_DIA'
+                WHEN coalesce(dt_atraso, 0) > 0 THEN 'EM_ABERTO'
+                ELSE NULL
+            END,
+            dt_ref
+        ) AS resolucao_mes
+    FROM base
+    GROUP BY 1, 2
+)
+SELECT
+    contrato,
+    array_agg(
+        CAST(
+            ROW(
+                mesref,
+                dt_primeiro_atraso,
+                dt_ultimo_atraso,
+                atraso_max,
+                dias_em_atraso,
+                resolucao_mes
+            )
+            AS ROW(
+                mesref VARCHAR,
+                dt_primeiro_atraso DATE,
+                dt_ultimo_atraso DATE,
+                atraso_max INTEGER,
+                dias_em_atraso BIGINT,
+                resolucao_mes VARCHAR
+            )
+        )
+        ORDER BY mesref
+    ) AS hist_atraso
+FROM resumo_mes
+GROUP BY contrato;
+```
+
+---
+
+# 16. Como consultar `hist_atraso`
+
+Suponha uma tabela final `contrato_hist`.
+
+## Explodir o histórico
+
+```sql
+SELECT
+    contrato,
+    x.mesref,
+    x.dt_primeiro_atraso,
+    x.atraso_max,
+    x.resolucao_mes
+FROM contrato_hist
+CROSS JOIN UNNEST(hist_atraso) AS t(x);
+```
+
+## Contratos com atraso máximo acima de 30
+
+```sql
+SELECT DISTINCT contrato
+FROM contrato_hist
+CROSS JOIN UNNEST(hist_atraso) AS t(x)
+WHERE x.atraso_max >= 30;
+```
+
+## Último mês com atraso
+
+```sql
+SELECT
+    contrato,
+    element_at(hist_atraso, -1).mesref AS ultimo_mes,
+    element_at(hist_atraso, -1).atraso_max AS atraso_max_ultimo_mes
+FROM contrato_hist;
+```
+
+## Pior atraso histórico
+
+```sql
+SELECT
+    contrato,
+    array_max(transform(hist_atraso, x -> x.atraso_max)) AS pior_atraso
+FROM contrato_hist;
+```
+
+---
+
+# 17. Como montar histórico de escritório
+
+## Base
+
+```text
+contrato | anomesdia | escritorio
+---------+-----------+-----------
+123      | 20260101  | A
+123      | 20260201  | A
+123      | 20260301  | B
+```
+
+## Query
+
+```sql
+WITH base AS (
+    SELECT
+        contrato,
+        substr(cast(anomesdia AS varchar), 1, 6) AS mesref,
+        escritorio
+    FROM origem
+),
+foto_mes AS (
+    SELECT
+        contrato,
+        mesref,
+        max_by(escritorio, mesref) AS escritorio_mes
+    FROM base
+    GROUP BY 1, 2
+)
+SELECT
+    contrato,
+    array_agg(
+        CAST(
+            ROW(mesref, escritorio_mes)
+            AS ROW(mesref VARCHAR, escritorio VARCHAR)
+        )
+        ORDER BY mesref
+    ) AS hist_escritorio
+FROM foto_mes
+GROUP BY contrato;
+```
+
+## Ver quantos escritórios distintos o contrato teve
+
+```sql
+SELECT
+    contrato,
+    cardinality(
+        array_distinct(
+            transform(hist_escritorio, x -> x.escritorio)
+        )
+    ) AS qtd_escritorios
+FROM contrato_hist;
+```
+
+## Contratos que trocaram de escritório
+
+```sql
+SELECT
+    contrato
+FROM contrato_hist
+WHERE cardinality(
+    array_distinct(
+        transform(hist_escritorio, x -> x.escritorio)
+    )
+) > 1;
+```
+
+---
+
+# 18. Como montar histórico de eventos
+
+## Base
+
+```text
+contrato | anomesdia | evento
+---------+-----------+-------------
+123      | 20260103  | ENTRADA
+123      | 20260211  | ACIONAMENTO
+123      | 20260302  | ACORDO
+```
+
+## Query
+
+```sql
+WITH base AS (
+    SELECT
+        contrato,
+        cast(date_parse(cast(anomesdia AS varchar), '%Y%m%d') AS date) AS dt_evento,
+        cast(evento AS varchar) AS evento
+    FROM origem
+    WHERE evento IS NOT NULL
+)
+SELECT
+    contrato,
+    array_agg(
+        CAST(
+            ROW(dt_evento, evento)
+            AS ROW(dt_evento DATE, evento VARCHAR)
+        )
+        ORDER BY dt_evento
+    ) AS hist_eventos
+FROM base
+GROUP BY contrato;
+```
+
+## Contar acordos
+
+```sql
+SELECT
+    contrato,
+    cardinality(
+        filter(hist_eventos, x -> x.evento = 'ACORDO')
+    ) AS qtd_acordos
+FROM contrato_hist;
+```
+
+---
+
+# 19. Como montar histórico de status
+
+## Query
+
+```sql
+WITH base AS (
+    SELECT
+        contrato,
+        substr(cast(anomesdia AS varchar), 1, 6) AS mesref,
+        status
+    FROM origem
+),
+foto_mes AS (
+    SELECT
+        contrato,
+        mesref,
+        max_by(status, mesref) AS status_mes
+    FROM base
+    GROUP BY 1, 2
+)
+SELECT
+    contrato,
+    array_agg(
+        CAST(
+            ROW(mesref, status_mes)
+            AS ROW(mesref VARCHAR, status VARCHAR)
+        )
+        ORDER BY mesref
+    ) AS hist_status
+FROM foto_mes
+GROUP BY contrato;
+```
+
+## Pegar status atual
+
+```sql
+SELECT
+    contrato,
+    element_at(hist_status, -1).status AS status_atual
+FROM contrato_hist;
+```
+
+## Montar jornada em string
+
+```sql
+SELECT
+    contrato,
+    array_join(
+        transform(hist_status, x -> x.status),
+        ' -> '
+    ) AS jornada_status
+FROM contrato_hist;
+```
+
+Resultado exemplo:
+
+```text
+OK -> ATRASO -> ACORDO
+```
+
+---
+
+# 20. Como gerar transições para Sankey ou roll-rate
+
+Aqui você quer transformar uma sequência em pares consecutivos.
+
+Exemplo:
+
+```text
+OK -> ATRASO
+ATRASO -> ACORDO
+ACORDO -> QUEBRA
+```
+
+## Exemplo com `hist_status`
+
+```sql
+WITH explodido AS (
+    SELECT
+        contrato,
+        x.mesref,
+        x.status
+    FROM contrato_hist
+    CROSS JOIN UNNEST(hist_status) AS t(x)
+),
+ordenado AS (
+    SELECT
+        contrato,
+        mesref,
+        status,
+        lag(status) OVER (PARTITION BY contrato ORDER BY mesref) AS status_anterior
+    FROM explodido
+)
+SELECT
+    status_anterior AS origem,
+    status AS destino,
+    count(*) AS qtd
+FROM ordenado
+WHERE status_anterior IS NOT NULL
+GROUP BY 1, 2;
+```
+
+Isso já gera uma base de transições.
+
+---
+
+# 21. Como decidir se vale usar array
+
+## Use array quando
+
+* a pergunta é sobre trajetória
+* você quer histórico por contrato
+* você quer sequência de eventos
+* você quer reduzir reconstrução repetida
+* você quer features comportamentais
+
+## Não use array sozinho quando
+
+* a maioria das perguntas é de BI simples
+* o consumidor principal é dashboard
+* você precisa fazer muitos joins
+* toda query vai explodir o array de qualquer jeito
+
+---
+
+# 22. Arquitetura recomendada
+
+O desenho mais robusto não é substituir tudo por array.
+
+É ter camadas:
+
+## 1. Base diária
+
+Grão:
+
+```text
+contrato + anomesdia
+```
+
+Serve para:
+
+* auditoria
+* debug
+* reconstrução
+
+## 2. Base mensal tabular
+
+Grão:
+
+```text
+contrato + mesref
+```
+
+Serve para:
+
+* BI
+* filtros simples
+* snapshot mensal
+
+## 3. Base histórica com arrays
+
+Grão:
+
+```text
+contrato
+```
+
+Serve para:
+
+* jornada
+* trajetória
+* Sankey
+* roll-rate
+* features
+
+---
+
+# 23. Armadilhas comuns
+
+## 1. Não ordenar dentro do `array_agg`
+
+Errado:
+
+```sql
+array_agg(status)
+```
+
+Certo:
+
+```sql
+array_agg(status ORDER BY dt_ref)
+```
+
+## 2. Usar `distinct` para tentar modelar
+
+`distinct` pode remover duplicidade, mas não define:
+
+* qual linha do mês é a correta
+* qual é a última foto
+* qual é o pico
+* qual é a resolução
+
+## 3. Explodir arrays o tempo todo
+
+Se toda consulta fizer:
+
+```sql
+CROSS JOIN UNNEST(hist_atraso)
+```
+
+talvez você precise de uma tabela tabular derivada também.
+
+## 4. Misturar grãos na mesma tabela
+
+Evite colocar na mesma tabela:
+
+* linha diária
+* linha mensal
+* linha por contrato histórico
+
+Cada uma atende uma pergunta diferente.
+
+---
+
+# 24. Exemplo de tabela final completa
+
+```sql
+CREATE TABLE analytics.contrato_hist_analitico
+WITH (
+    format = 'PARQUET',
+    external_location = 's3://seu-bucket/analytics/contrato_hist_analitico/'
+) AS
+WITH base AS (
+    SELECT
+        contrato,
+        anomesdia,
+        substr(cast(anomesdia AS varchar), 1, 6) AS mesref,
+        cast(date_parse(cast(anomesdia AS varchar), '%Y%m%d') AS date) AS dt_ref,
+        cast(dt_atraso AS integer) AS dt_atraso,
+        cast(status AS varchar) AS status,
+        cast(escritorio AS varchar) AS escritorio,
+        cast(evento AS varchar) AS evento
+    FROM origem
+),
+foto_mes AS (
+    SELECT
+        contrato,
+        mesref,
+        max_by(status, anomesdia) AS status_mes,
+        max_by(escritorio, anomesdia) AS escritorio_mes
+    FROM base
+    GROUP BY 1, 2
+),
+atraso_mes AS (
+    SELECT
+        contrato,
+        mesref,
+        min(CASE WHEN coalesce(dt_atraso, 0) > 0 THEN dt_ref END) AS dt_primeiro_atraso,
+        max(CASE WHEN coalesce(dt_atraso, 0) > 0 THEN dt_ref END) AS dt_ultimo_atraso,
+        max(CASE WHEN coalesce(dt_atraso, 0) > 0 THEN dt_atraso END) AS atraso_max,
+        count_if(coalesce(dt_atraso, 0) > 0) AS dias_em_atraso,
+        max_by(
+            CASE
+                WHEN coalesce(status, '') IN ('ACORDO', 'RENEGOCIADO') THEN 'RENEGOCIADO'
+                WHEN coalesce(dt_atraso, 0) = 0 THEN 'COLOCADO_EM_DIA'
+                WHEN coalesce(dt_atraso, 0) > 0 THEN 'EM_ABERTO'
+                ELSE NULL
+            END,
+            anomesdia
+        ) AS resolucao_mes
+    FROM base
+    GROUP BY 1, 2
+),
+hist_atraso AS (
+    SELECT
+        contrato,
+        array_agg(
+            CAST(
+                ROW(
+                    mesref,
+                    dt_primeiro_atraso,
+                    dt_ultimo_atraso,
+                    atraso_max,
+                    dias_em_atraso,
+                    resolucao_mes
+                )
+                AS ROW(
+                    mesref VARCHAR,
+                    dt_primeiro_atraso DATE,
+                    dt_ultimo_atraso DATE,
+                    atraso_max INTEGER,
+                    dias_em_atraso BIGINT,
+                    resolucao_mes VARCHAR
+                )
+            )
+            ORDER BY mesref
+        ) AS hist_atraso
+    FROM atraso_mes
+    GROUP BY contrato
+),
+hist_status AS (
+    SELECT
+        contrato,
+        array_agg(
+            CAST(
+                ROW(mesref, status_mes)
+                AS ROW(mesref VARCHAR, status VARCHAR)
+            )
+            ORDER BY mesref
+        ) AS hist_status
+    FROM foto_mes
+    GROUP BY contrato
+),
+hist_escritorio AS (
+    SELECT
+        contrato,
+        array_agg(
+            CAST(
+                ROW(mesref, escritorio_mes)
+                AS ROW(mesref VARCHAR, escritorio VARCHAR)
+            )
+            ORDER BY mesref
+        ) AS hist_escritorio
+    FROM foto_mes
+    GROUP BY contrato
+),
+hist_eventos AS (
+    SELECT
+        contrato,
+        array_agg(
+            CAST(
+                ROW(dt_ref, evento)
+                AS ROW(dt_evento DATE, evento VARCHAR)
+            )
+            ORDER BY dt_ref
+        ) FILTER (WHERE evento IS NOT NULL) AS hist_eventos
+    FROM base
+    GROUP BY contrato
+)
+SELECT
+    c.contrato,
+    a.hist_atraso,
+    s.hist_status,
+    e.hist_escritorio,
+    v.hist_eventos
+FROM (SELECT DISTINCT contrato FROM base) c
+LEFT JOIN hist_atraso a ON c.contrato = a.contrato
+LEFT JOIN hist_status s ON c.contrato = s.contrato
+LEFT JOIN hist_escritorio e ON c.contrato = e.contrato
+LEFT JOIN hist_eventos v ON c.contrato = v.contrato;
+```
+
+---
+
+# 25. Resumo final
+
+## Ferramentas mais importantes
+
+* `ARRAY[...]`
+* `array_agg(...)`
+* `element_at(...)`
+* `cardinality(...)`
+* `contains(...)`
+* `transform(...)`
+* `filter(...)`
+* `array_distinct(...)`
+* `array_join(...)`
+* `CROSS JOIN UNNEST(...)`
+* `ROW(...)`
+* `CAST(... AS ROW(...))`
+
+## Perguntas que arrays resolvem bem
+
+* qual foi a trajetória do contrato?
+* quando entrou em atraso?
+* quantos acordos já teve?
+* quantos escritórios já assumiram?
+* qual a sequência de status?
+* como gerar transições entre estados?
+
+## Perguntas que tabelas tabulares resolvem melhor
+
+* quantos contratos fecharam o mês em atraso?
+* qual escritório tinha mais atraso no mês?
+* qual foi o snapshot do fechamento?
+* qual o total por mês?
+
+---
+
+Se você quiser, eu posso transformar isso na próxima resposta em uma versão ainda mais completa no formato **README de GitHub premium**, com:
+
+* índice navegável
+* seção de troubleshooting
+* exemplos errados vs corretos
+* padrões de modelagem para contrato, cliente, boleto e acordo.
