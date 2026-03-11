@@ -1,0 +1,471 @@
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from typing import Dict, List, Set, Tuple, DefaultDict
+from collections import defaultdict
+import re
+
+try:
+    import sqlglot
+    from sqlglot import exp
+except ImportError as e:
+    raise ImportError(
+        "Este script precisa da biblioteca 'sqlglot'. "
+        "Instale com: pip install sqlglot"
+    ) from e
+
+
+@dataclass
+class NodeInfo:
+    nome: str
+    tipo: str  # cte | tabela | final
+    depende_de: Set[str] = field(default_factory=set)
+    referencias_tabelas: Set[str] = field(default_factory=set)
+
+
+def normalizar_identificador(nome: str) -> str:
+    nome = nome.strip()
+    nome = nome.replace('"', "")
+    nome = nome.replace("`", "")
+    return nome.lower()
+
+
+def remover_alias_de_nome(nome: str) -> str:
+    """
+    Ex.: 'etapa_1 as e' -> 'etapa_1'
+         'pag p' -> 'pag'
+    """
+    nome = normalizar_identificador(nome)
+    nome = re.sub(r"\s+as\s+\w+$", "", nome)
+    nome = re.sub(r"\s+\w+$", "", nome)
+    return nome.strip()
+
+
+def extrair_tabelas_de_expressao(
+    expr: exp.Expression,
+    nomes_cte: Set[str],
+) -> Tuple[Set[str], Set[str]]:
+    """
+    Retorna:
+    - dependencias_cte
+    - tabelas_fisicas
+    """
+    dependencias_cte = set()
+    tabelas_fisicas = set()
+
+    for table in expr.find_all(exp.Table):
+        sql_tabela = normalizar_identificador(table.sql(dialect="trino"))
+
+        if table.name:
+            bruto = normalizar_identificador(table.name)
+            if bruto in nomes_cte:
+                dependencias_cte.add(sql_tabela)
+            else:
+                tabelas_fisicas.add(sql_tabela)
+        else:
+            if sql_tabela in nomes_cte:
+                dependencias_cte.add(sql_tabela)
+            else:
+                tabelas_fisicas.add(sql_tabela)
+
+    return dependencias_cte, tabelas_fisicas
+
+
+def obter_ctes(query: str) -> Dict[str, exp.CTE]:
+    parsed = sqlglot.parse_one(query, read="trino")
+    ctes = {}
+
+    with_expr = parsed.args.get("with")
+    if not with_expr:
+        return ctes
+
+    for cte in with_expr.find_all(exp.CTE):
+        alias = cte.alias_or_name
+        if alias:
+            ctes[normalizar_identificador(alias)] = cte
+
+    return ctes
+
+
+def construir_grafo(query: str) -> Tuple[Dict[str, NodeInfo], exp.Expression]:
+    parsed = sqlglot.parse_one(query, read="trino")
+    ctes = obter_ctes(query)
+    nomes_cte = set(ctes.keys())
+
+    grafo: Dict[str, NodeInfo] = {}
+
+    for nome_cte, cte_obj in ctes.items():
+        info = NodeInfo(nome=nome_cte, tipo="cte")
+        corpo = cte_obj.this
+        deps_cte, tabelas = extrair_tabelas_de_expressao(corpo, nomes_cte)
+        info.depende_de.update(deps_cte - {nome_cte})
+        info.referencias_tabelas.update(tabelas)
+        grafo[nome_cte] = info
+
+    final_node = NodeInfo(nome="__final__", tipo="final")
+
+    deps_cte_final, tabelas_final = extrair_tabelas_de_expressao(parsed, nomes_cte)
+    final_node.depende_de.update(deps_cte_final)
+    final_node.referencias_tabelas.update(tabelas_final)
+    grafo[final_node.nome] = final_node
+
+    todas_tabelas = set()
+    for info in grafo.values():
+        todas_tabelas.update(info.referencias_tabelas)
+
+    for tabela in sorted(todas_tabelas):
+        if tabela not in grafo:
+            grafo[tabela] = NodeInfo(nome=tabela, tipo="tabela")
+
+    return grafo, parsed
+
+
+def ordenar_ctes_topologicamente(grafo: Dict[str, NodeInfo]) -> List[str]:
+    ctes = {k: v for k, v in grafo.items() if v.tipo == "cte"}
+    visitado = set()
+    pilha = []
+    temp = set()
+
+    def dfs(no: str):
+        if no in visitado:
+            return
+        if no in temp:
+            raise ValueError(f"Ciclo detectado envolvendo: {no}")
+        temp.add(no)
+        for dep in ctes[no].depende_de:
+            dep_norm = remover_alias_de_nome(dep)
+            if dep_norm in ctes:
+                dfs(dep_norm)
+        temp.remove(no)
+        visitado.add(no)
+        pilha.append(no)
+
+    for no in ctes:
+        if no not in visitado:
+            dfs(no)
+
+    return pilha
+
+
+def gerar_resumo_dependencias(grafo: Dict[str, NodeInfo]) -> str:
+    linhas = []
+    for nome, info in grafo.items():
+        if info.tipo == "tabela":
+            continue
+        deps = ", ".join(sorted(info.depende_de)) if info.depende_de else "-"
+        tabs = ", ".join(sorted(info.referencias_tabelas)) if info.referencias_tabelas else "-"
+        linhas.append(
+            f"{nome} | tipo={info.tipo} | depende_de=[{deps}] | tabelas=[{tabs}]"
+        )
+    return "\n".join(linhas)
+
+
+def gerar_dag_texto(grafo: Dict[str, NodeInfo]) -> str:
+    arestas = []
+
+    for nome, info in grafo.items():
+        if info.tipo == "tabela":
+            continue
+
+        for dep in sorted(info.depende_de):
+            arestas.append(f"{dep} -> {nome}")
+
+        for tabela in sorted(info.referencias_tabelas):
+            arestas.append(f"{tabela} -> {nome}")
+
+    return "\n".join(arestas)
+
+
+def gerar_mermaid(grafo: Dict[str, NodeInfo]) -> str:
+    linhas = ["flowchart TD"]
+
+    def safe_id(nome: str) -> str:
+        return re.sub(r"[^a-zA-Z0-9_]", "_", nome)
+
+    for nome, info in grafo.items():
+        no_id = safe_id(nome)
+        if info.tipo == "cte":
+            linhas.append(f'    {no_id}["CTE: {nome}"]')
+        elif info.tipo == "final":
+            linhas.append(f'    {no_id}["SELECT FINAL"]')
+        else:
+            linhas.append(f'    {no_id}["TAB: {nome}"]')
+
+    for nome, info in grafo.items():
+        destino = safe_id(nome)
+        if info.tipo == "tabela":
+            continue
+
+        for dep in sorted(info.depende_de):
+            linhas.append(f"    {safe_id(dep)} --> {destino}")
+
+        for tabela in sorted(info.referencias_tabelas):
+            linhas.append(f"    {safe_id(tabela)} --> {destino}")
+
+    return "\n".join(linhas)
+
+
+def extrair_select_final_sem_with(query: str) -> str:
+    parsed = sqlglot.parse_one(query, read="trino")
+    return parsed.sql(dialect="trino", pretty=True)
+
+
+def obter_alias_to_source(expr: exp.Expression) -> Dict[str, str]:
+    """
+    Mapeia alias -> origem real
+    Ex:
+      FROM etapa_1 e -> {'e': 'etapa_1'}
+      JOIN pag p -> {'p': 'pag'}
+    """
+    alias_map: Dict[str, str] = {}
+
+    for table in expr.find_all(exp.Table):
+        source_name = normalizar_identificador(table.name or table.sql(dialect="trino"))
+        alias = table.alias
+
+        if alias:
+            alias_map[normalizar_identificador(alias)] = source_name
+
+        alias_map[source_name] = source_name
+
+    return alias_map
+
+
+def quebrar_ands(expr: exp.Expression) -> List[exp.Expression]:
+    if isinstance(expr, exp.And):
+        return quebrar_ands(expr.left) + quebrar_ands(expr.right)
+    return [expr]
+
+
+def extrair_chaves_join_de_toda_query(query: str) -> Dict[str, List[str]]:
+    """
+    Captura dinamicamente, em toda a query, as colunas usadas em joins.
+
+    Ex:
+      LEFT JOIN tabela t
+        ON t.escritorio = f.escritorio
+       AND t.mesref = f.mesref
+
+    Retorna:
+      {
+        "tabela": ["escritorio", "mesref"],
+        "final": ["escritorio", "mesref"]
+      }
+    """
+    parsed = sqlglot.parse_one(query, read="trino")
+    alias_to_source = obter_alias_to_source(parsed)
+
+    keys_by_source: DefaultDict[str, List[str]] = defaultdict(list)
+
+    for join in parsed.find_all(exp.Join):
+        on_expr = join.args.get("on")
+        if not on_expr:
+            continue
+
+        for cond in quebrar_ands(on_expr):
+            if not isinstance(cond, exp.EQ):
+                continue
+
+            left = cond.left
+            right = cond.right
+
+            if not isinstance(left, exp.Column) or not isinstance(right, exp.Column):
+                continue
+
+            if not left.table or not right.table:
+                continue
+
+            left_alias = normalizar_identificador(left.table)
+            right_alias = normalizar_identificador(right.table)
+
+            left_source = alias_to_source.get(left_alias, left_alias)
+            right_source = alias_to_source.get(right_alias, right_alias)
+
+            left_col = normalizar_identificador(left.name)
+            right_col = normalizar_identificador(right.name)
+
+            if left_col not in keys_by_source[left_source]:
+                keys_by_source[left_source].append(left_col)
+
+            if right_col not in keys_by_source[right_source]:
+                keys_by_source[right_source].append(right_col)
+
+    return dict(keys_by_source)
+
+
+def sql_concat_distinct(cols: List[str], alias: str) -> str:
+    """
+    Gera:
+    COUNT(DISTINCT CONCAT(CAST(col1 AS VARCHAR), '||', CAST(col2 AS VARCHAR))) alias
+    """
+    if len(cols) == 1:
+        return f"COUNT(DISTINCT {cols[0]}) {alias}"
+
+    partes = []
+    for i, col in enumerate(cols):
+        if i > 0:
+            partes.append("'||'")
+        partes.append(f"CAST({col} AS VARCHAR)")
+
+    return f"COUNT(DISTINCT CONCAT({', '.join(partes)})) {alias}"
+
+
+def listar_alvos_auditoria(
+    grafo: Dict[str, NodeInfo],
+    incluir_tabelas_fisicas: bool = False,
+) -> List[str]:
+    alvos = ordenar_ctes_topologicamente(grafo)
+
+    if incluir_tabelas_fisicas:
+        tabelas = sorted([k for k, v in grafo.items() if v.tipo == "tabela"])
+        alvos.extend(tabelas)
+
+    return list(dict.fromkeys(alvos))
+
+
+def gerar_query_auditoria_simples(
+    grafo: Dict[str, NodeInfo],
+    query_original: str,
+    incluir_tabelas_fisicas: bool = False,
+) -> str:
+    """
+    Gera algo como:
+
+    SELECT 'src' etapa, COUNT(*) linhas, COUNT(DISTINCT ...) distinct_join_x FROM src
+    UNION ALL
+    SELECT 'pag', COUNT(*) linhas, COUNT(DISTINCT ...) distinct_join_y FROM pag
+    """
+    alvos = listar_alvos_auditoria(
+        grafo=grafo,
+        incluir_tabelas_fisicas=incluir_tabelas_fisicas,
+    )
+
+    join_keys_map = extrair_chaves_join_de_toda_query(query_original)
+
+    blocos = []
+
+    for i, alvo in enumerate(alvos):
+        metricas = ["COUNT(*) linhas"]
+
+        alvo_sem_alias = remover_alias_de_nome(alvo)
+        chaves_join = join_keys_map.get(alvo_sem_alias, [])
+
+        if chaves_join:
+            alias_join = "_".join(chaves_join)
+            metricas.append(
+                sql_concat_distinct(
+                    chaves_join,
+                    alias=f"distinct_join_{alias_join}"
+                )
+            )
+
+        if i == 0:
+            bloco = f"SELECT '{alvo}' etapa, " + ", ".join(metricas) + f" FROM {alvo}"
+        else:
+            bloco = f"SELECT '{alvo}', " + ", ".join(metricas) + f" FROM {alvo}"
+
+        blocos.append(bloco)
+
+    return "\nUNION ALL\n".join(blocos) + ";"
+
+
+def analisar_query_sql(
+    query: str,
+    incluir_tabelas_fisicas_na_auditoria: bool = False,
+) -> Dict[str, str]:
+    grafo, _ = construir_grafo(query)
+    resumo = gerar_resumo_dependencias(grafo)
+    dag_texto = gerar_dag_texto(grafo)
+    mermaid = gerar_mermaid(grafo)
+    select_final_sem_with = extrair_select_final_sem_with(query)
+
+    auditoria = gerar_query_auditoria_simples(
+        grafo=grafo,
+        query_original=query,
+        incluir_tabelas_fisicas=incluir_tabelas_fisicas_na_auditoria,
+    )
+
+    return {
+        "resumo_dependencias": resumo,
+        "dag_texto": dag_texto,
+        "mermaid": mermaid,
+        "select_final_sem_with": select_final_sem_with,
+        "query_auditoria": auditoria,
+    }
+
+
+if __name__ == "__main__":
+    sql = """
+    WITH src AS (
+        SELECT
+            contrato,
+            cnpj,
+            id_cliente,
+            escritorio,
+            mesref,
+            dt_ref
+        FROM cobranca.base_contratos
+        WHERE anomes = 202602
+    ),
+    pag AS (
+        SELECT
+            contrato,
+            escritorio,
+            mesref,
+            valor_pago
+        FROM financeiro.base_pagamentos
+        WHERE anomes = 202602
+    ),
+    etapa_1 AS (
+        SELECT
+            s.contrato,
+            s.cnpj,
+            s.id_cliente,
+            s.escritorio,
+            s.mesref,
+            p.valor_pago
+        FROM src AS s
+        LEFT JOIN pag AS p
+            ON s.contrato = p.contrato
+           AND s.escritorio = p.escritorio
+           AND s.mesref = p.mesref
+    ),
+    etapa_2 AS (
+        SELECT
+            e.*,
+            CASE
+                WHEN EXISTS(
+                    SELECT 1
+                    FROM juridico.base_execucao AS j
+                    WHERE j.contrato = e.contrato
+                      AND j.escritorio = e.escritorio
+                )
+                THEN 1
+                ELSE 0
+            END AS fl_execucao
+        FROM etapa_1 AS e
+    )
+    SELECT
+      *
+    FROM etapa_2
+    """
+
+    resultado = analisar_query_sql(
+        query=sql,
+        incluir_tabelas_fisicas_na_auditoria=True,
+    )
+
+    print("\n=== RESUMO DE DEPENDÊNCIAS ===\n")
+    print(resultado["resumo_dependencias"])
+
+    print("\n=== DAG TEXTO ===\n")
+    print(resultado["dag_texto"])
+
+    print("\n=== MERMAID ===\n")
+    print(resultado["mermaid"])
+
+    print("\n=== SELECT FINAL SEM WITH ===\n")
+    print(resultado["select_final_sem_with"])
+
+    print("\n=== QUERY DE AUDITORIA ===\n")
+    print(resultado["query_auditoria"])
