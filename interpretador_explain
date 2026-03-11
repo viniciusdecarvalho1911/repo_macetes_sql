@@ -1,0 +1,1291 @@
+import re
+import json
+from collections import Counter, defaultdict
+from textwrap import dedent
+
+
+class AthenaExplainInterpreterV4:
+    """
+    Interpretador heurístico de EXPLAIN / EXPLAIN ANALYZE para Athena/Trino.
+
+    Objetivo:
+    - Ler planos gigantes
+    - Resumir hotspots
+    - Sugerir melhorias
+    - Tentar mapear blocos suspeitos do SQL original
+    """
+
+    def __init__(self, explain_text: str, sql_text: str | None = None):
+        self.text = explain_text or ""
+        self.sql = sql_text or ""
+        self.lines = self.text.splitlines()
+
+    # =========================
+    # Helpers básicos
+    # =========================
+    def _find_all(self, pattern, flags=re.IGNORECASE):
+        return re.findall(pattern, self.text, flags)
+
+    def _count(self, pattern, flags=re.IGNORECASE):
+        return len(re.findall(pattern, self.text, flags))
+
+    def _contains(self, pattern, flags=re.IGNORECASE):
+        return bool(re.search(pattern, self.text, flags))
+
+    # =========================
+    # Estrutura geral do plano
+    # =========================
+    def detect_fragments(self):
+        patterns = [
+            r"\bFragment\s+\d+\b",
+            r"\bFragment\s+\[\d+\]\b",
+            r"\bSubPlan\b"
+        ]
+        found = []
+        for p in patterns:
+            found.extend(re.findall(p, self.text, re.IGNORECASE))
+        return len(found)
+
+    def count_operators(self):
+        operators = {
+            "TableScan": r"\bTableScan\b",
+            "ScanFilterProject": r"\bScanFilterProject\b",
+            "Filter": r"\bFilter\b",
+            "Project": r"\bProject\b",
+            "Join": r"\bJoin\b",
+            "CrossJoin": r"\bCrossJoin\b",
+            "SemiJoin": r"\bSemiJoin\b",
+            "Aggregation": r"\bAggregation\b",
+            "MarkDistinct": r"\bMarkDistinct\b",
+            "Window": r"\bWindow\b",
+            "RowNumber": r"\bRowNumber\b",
+            "TopN": r"\bTopN\b",
+            "Sort": r"\bSort\b",
+            "Exchange": r"\bExchange\b",
+            "RemoteSource": r"\bRemoteSource\b",
+            "Unnest": r"\bUnnest\b",
+            "Limit": r"\bLimit\b",
+            "Values": r"\bValues\b"
+        }
+
+        counts = {}
+        for name, pattern in operators.items():
+            counts[name] = self._count(pattern)
+        return counts
+
+    # =========================
+    # Tabelas / scans
+    # =========================
+    def detect_tables(self):
+        patterns = [
+            r"table\s*=\s*([\w\.\-\"`]+)",
+            r"TableScan\[[^\]]*?([\w]+\.[\w]+)[^\]]*\]",
+            r"\bfrom\s+([\w]+\.[\w]+)\b"
+        ]
+
+        tables = []
+        for p in patterns:
+            tables.extend(self._find_all(p))
+
+        normalized = []
+        for t in tables:
+            t = t.strip().strip('"').strip("`")
+            if "." in t:
+                normalized.append(t.lower())
+
+        return Counter(normalized)
+
+    def detect_repeated_scans(self):
+        tables = self.detect_tables()
+        repeated = {k: v for k, v in tables.items() if v > 1}
+        return dict(sorted(repeated.items(), key=lambda x: x[1], reverse=True))
+
+    # =========================
+    # Joins
+    # =========================
+    def detect_join_types(self):
+        patterns = [
+            r"\b(INNER|LEFT|RIGHT|FULL|CROSS)\s+JOIN\b",
+            r"\bJoin\[(INNER|LEFT|RIGHT|FULL|CROSS)",
+        ]
+        found = []
+        for p in patterns:
+            found.extend(self._find_all(p))
+        found = [x.upper() for x in found]
+        return Counter(found)
+
+    def detect_distribution_types(self):
+        dist = {
+            "PARTITIONED": self._count(r"\bPARTITIONED\b"),
+            "REPLICATED": self._count(r"\bREPLICATED\b"),
+            "HASH": self._count(r"\bHASH\b"),
+            "SINGLE": self._count(r"\bSINGLE\b"),
+            "BROADCAST_HINT": self._count(r"\bBROADCAST\b"),
+        }
+        return dist
+
+    def detect_cross_join(self):
+        return self._contains(r"\bCrossJoin\b|\bCROSS\s+JOIN\b")
+
+    # =========================
+    # Filtros / pruning
+    # =========================
+    def detect_filters(self):
+        return {
+            "Filter": self._count(r"\bFilter\b"),
+            "ScanFilterProject": self._count(r"\bScanFilterProject\b"),
+            "predicate_mentions": self._count(r"\bpredicate\b|\bfilterPredicate\b|\blayout\b|\bconstraint\b")
+        }
+
+    def detect_partition_signals(self):
+        signals = {
+            "partition_mentions": self._count(r"\bpartition\b"),
+            "partitions_scanned_mentions": self._count(r"\bpartitions?\b"),
+            "dynamic_filter_mentions": self._count(r"\bdynamic\s*filter\b"),
+            "where_mentions_in_sql": self._count(r"\bwhere\b", flags=re.IGNORECASE) if self.sql else 0
+        }
+        return signals
+
+    def detect_possible_missing_pruning(self):
+        tables = self.detect_tables()
+        filters = self.detect_filters()
+        part = self.detect_partition_signals()
+
+        reasons = []
+
+        if sum(tables.values()) >= 3 and filters["Filter"] + filters["ScanFilterProject"] == 0:
+            reasons.append("Há vários scans e quase nenhum operador explícito de filtro no plano.")
+
+        if part["partition_mentions"] == 0 and self.sql:
+            if re.search(r"\banomes\b|\banomesdia\b|\bdt_\w+\b|\bdata\b|\bmesref\b", self.sql, re.IGNORECASE):
+                reasons.append("O SQL aparenta usar colunas temporais, mas o plano quase não menciona partições/pruning.")
+
+        if tables and len(tables) >= 2 and filters["predicate_mentions"] == 0:
+            reasons.append("Há leituras de múltiplas tabelas sem sinais fortes de predicates/layout constraints no plano.")
+
+        return reasons
+
+    # =========================
+    # Exchange / shuffle / single node
+    # =========================
+    def detect_exchange_types(self):
+        patterns = [
+            r"\bExchange\s+(\w+)",
+            r"\bExchange\[(\w+)\]",
+        ]
+        found = []
+        for p in patterns:
+            found.extend(self._find_all(p))
+        found = [x.upper() for x in found]
+        return Counter(found)
+
+    def detect_single_node_risk(self):
+        reasons = []
+        single_count = self._count(r"\bSINGLE\b")
+        sort_count = self._count(r"\bSort\b")
+        global_agg_count = self._count(r"\bFinalAggregation\b|\bAggregation\b")
+
+        if single_count >= 2:
+            reasons.append(f"O plano menciona SINGLE {single_count} vezes, sugerindo gargalos concentrados em um nó.")
+        if single_count >= 1 and sort_count >= 1:
+            reasons.append("Há combinação de SINGLE com SORT, o que pode concentrar ordenação em um único nó.")
+        if single_count >= 1 and global_agg_count >= 2:
+            reasons.append("Há SINGLE junto de agregações, o que pode indicar estágio final serializado.")
+
+        return reasons
+
+    def detect_shuffle_risk(self):
+        exchanges = self.detect_exchange_types()
+        dist = self.detect_distribution_types()
+        reasons = []
+
+        total_exchange = sum(exchanges.values())
+        if total_exchange >= 5:
+            reasons.append(f"Há {total_exchange} exchanges no plano, sugerindo shuffle relevante entre nós.")
+
+        if dist["HASH"] >= 3:
+            reasons.append("Há muitos HASH exchanges, normalmente associados a reparticionamento por chave.")
+
+        if dist["PARTITIONED"] >= 2 and dist["REPLICATED"] == 0:
+            reasons.append("Predominam joins/steps PARTITIONED; isso costuma aumentar custo de redistribuição.")
+
+        return reasons
+
+    # =========================
+    # Window / sort / unnest
+    # =========================
+    def detect_advanced_operator_risks(self):
+        reasons = []
+
+        window_count = self._count(r"\bWindow\b")
+        sort_count = self._count(r"\bSort\b")
+        topn_count = self._count(r"\bTopN\b")
+        unnest_count = self._count(r"\bUnnest\b")
+        markdistinct_count = self._count(r"\bMarkDistinct\b")
+
+        if window_count >= 2:
+            reasons.append(f"Há {window_count} operadores Window; funções analíticas em cascata podem ser caras.")
+        if sort_count >= 2:
+            reasons.append(f"Há {sort_count} operadores Sort; ordenações múltiplas podem elevar memória e spill.")
+        if topn_count >= 2:
+            reasons.append(f"Há {topn_count} operadores TopN; pode haver ordenação parcial repetida.")
+        if unnest_count >= 1:
+            reasons.append("Há UNNEST no plano; isso pode multiplicar linhas e aumentar cardinalidade.")
+        if markdistinct_count >= 1:
+            reasons.append("Há MarkDistinct; DISTINCTs complexos podem gerar custo extra de memória.")
+
+        return reasons
+
+    # =========================
+    # Spill / memória / skew
+    # =========================
+    def detect_runtime_signals(self):
+        """
+        Funciona melhor quando o usuário cola EXPLAIN ANALYZE ou detalhes de execução.
+        """
+        signals = {
+            "spill_mentions": self._count(r"\bspill\b"),
+            "memory_mentions": self._count(r"\bmemory\b"),
+            "skew_mentions": self._count(r"\bskew\b"),
+            "blocked_mentions": self._count(r"\bblocked\b"),
+            "cpu_mentions": self._count(r"\bcpu\b"),
+            "scheduled_mentions": self._count(r"\bscheduled\b"),
+            "input_rows_mentions": self._count(r"\binput\b.*\brows\b|\binputRows\b"),
+            "output_rows_mentions": self._count(r"\boutput\b.*\brows\b|\boutputRows\b")
+        }
+        return signals
+
+    def detect_memory_skew_risk(self):
+        runtime = self.detect_runtime_signals()
+        reasons = []
+
+        if runtime["spill_mentions"] >= 1:
+            reasons.append("Há menção a spill; a query pode estar excedendo memória em operadores intermediários.")
+        if runtime["memory_mentions"] >= 2:
+            reasons.append("Há várias menções a memory; vale investigar pressão de memória nos stages.")
+        if runtime["skew_mentions"] >= 1:
+            reasons.append("Há sinal textual de skew; pode existir distribuição desigual de chaves.")
+        if runtime["blocked_mentions"] >= 2:
+            reasons.append("Há menções a blocked time; pode haver espera em exchange, I/O ou contenção.")
+        return reasons
+
+    # =========================
+    # SQL original / CTEs
+    # =========================
+    def detect_ctes_from_sql(self):
+        if not self.sql.strip():
+            return []
+
+        patterns = [
+            r"with\s+(.*?)\s+select",
+        ]
+
+        ctes = re.findall(r"(\w+)\s+as\s*\(", self.sql, re.IGNORECASE)
+        return [c.lower() for c in ctes]
+
+    def map_suspicious_ctes(self):
+        """
+        Heurística fraca, mas útil:
+        - tenta identificar CTEs com nomes sugestivos
+        - tenta cruzar quantidade de joins/windows/aggregations no SQL
+        """
+        if not self.sql.strip():
+            return []
+
+        ctes = self.detect_ctes_from_sql()
+        suspicious = []
+
+        for cte in ctes:
+            pattern = rf"{re.escape(cte)}\s+as\s*\((.*?)\)\s*(,|\bselect\b)"
+            match = re.search(pattern, self.sql, re.IGNORECASE | re.DOTALL)
+
+            if not match:
+                continue
+
+            body = match.group(1)
+
+            score = 0
+            reasons = []
+
+            join_count = len(re.findall(r"\bjoin\b", body, re.IGNORECASE))
+            window_count = len(re.findall(r"\bover\s*\(", body, re.IGNORECASE))
+            group_count = len(re.findall(r"\bgroup\s+by\b", body, re.IGNORECASE))
+            distinct_count = len(re.findall(r"\bdistinct\b", body, re.IGNORECASE))
+            union_count = len(re.findall(r"\bunion\b", body, re.IGNORECASE))
+            unnest_count = len(re.findall(r"\bunnest\b", body, re.IGNORECASE))
+
+            score += join_count * 2
+            score += window_count * 2
+            score += group_count * 2
+            score += distinct_count * 1
+            score += union_count * 2
+            score += unnest_count * 2
+
+            if join_count >= 2:
+                reasons.append(f"{join_count} joins")
+            if window_count >= 1:
+                reasons.append(f"{window_count} windows")
+            if group_count >= 1:
+                reasons.append(f"{group_count} agrupamentos")
+            if distinct_count >= 1:
+                reasons.append(f"{distinct_count} distincts")
+            if union_count >= 1:
+                reasons.append(f"{union_count} unions")
+            if unnest_count >= 1:
+                reasons.append(f"{unnest_count} unnest")
+
+            if score >= 4:
+                suspicious.append({
+                    "cte": cte,
+                    "score_heurstico": score,
+                    "motivos": reasons
+                })
+
+        suspicious = sorted(suspicious, key=lambda x: x["score_heurstico"], reverse=True)
+        return suspicious
+
+    # =========================
+    # Score de risco
+    # =========================
+    def estimate_cost_risk(self):
+        ops = self.count_operators()
+        dist = self.detect_distribution_types()
+
+        score = 0
+        score += ops["Join"] * 2
+        score += ops["Exchange"] * 3
+        score += ops["Window"] * 2
+        score += ops["Sort"] * 2
+        score += ops["Aggregation"] * 1
+        score += ops["Unnest"] * 3
+        score += ops["CrossJoin"] * 8
+        score += dist["SINGLE"] * 3
+        score += dist["PARTITIONED"] * 2
+
+        if score < 12:
+            return {"nivel": "Baixo", "score": score}
+        elif score < 25:
+            return {"nivel": "Médio", "score": score}
+        elif score < 40:
+            return {"nivel": "Alto", "score": score}
+        return {"nivel": "Muito Alto", "score": score}
+
+    # =========================
+    # Diagnóstico consolidado
+    # =========================
+    def build_findings(self):
+        findings = []
+
+        if self.detect_cross_join():
+            findings.append({
+                "categoria": "Join",
+                "severidade": "Crítica",
+                "titulo": "Cross join detectado",
+                "evidencia": "O plano contém CROSS JOIN / CrossJoin.",
+                "impacto": "Pode multiplicar linhas de forma explosiva.",
+                "acao": "Validar condição de join ausente ou reestruturar lógica."
+            })
+
+        for reason in self.detect_single_node_risk():
+            findings.append({
+                "categoria": "Distribuição",
+                "severidade": "Alta",
+                "titulo": "Possível gargalo single-node",
+                "evidencia": reason,
+                "impacto": "Parte do processamento pode ficar concentrada em um único nó.",
+                "acao": "Reduzir ordenações finais, agregações globais e reavaliar desenho do SQL."
+            })
+
+        for reason in self.detect_shuffle_risk():
+            findings.append({
+                "categoria": "Shuffle",
+                "severidade": "Alta",
+                "titulo": "Alto volume potencial de redistribuição",
+                "evidencia": reason,
+                "impacto": "Pode elevar tempo, custo e uso de rede entre nós.",
+                "acao": "Filtrar antes de join, pré-agregar, materializar etapas e revisar chaves."
+            })
+
+        for reason in self.detect_advanced_operator_risks():
+            findings.append({
+                "categoria": "Operadores caros",
+                "severidade": "Média",
+                "titulo": "Operadores analíticos custosos",
+                "evidencia": reason,
+                "impacto": "Pode aumentar CPU, memória e spill.",
+                "acao": "Reduzir janelas desnecessárias, ordenar menos e materializar blocos complexos."
+            })
+
+        for reason in self.detect_memory_skew_risk():
+            findings.append({
+                "categoria": "Runtime",
+                "severidade": "Alta",
+                "titulo": "Sinais de spill / memória / skew",
+                "evidencia": reason,
+                "impacto": "Pode causar degradação forte de performance.",
+                "acao": "Investigar cardinalidade, skew de chave, tamanho das partições e estágios críticos."
+            })
+
+        for reason in self.detect_possible_missing_pruning():
+            findings.append({
+                "categoria": "Scan / pruning",
+                "severidade": "Alta",
+                "titulo": "Possível falta de partition pruning",
+                "evidencia": reason,
+                "impacto": "Mais dados podem estar sendo lidos do que o necessário.",
+                "acao": "Garantir filtro na coluna de partição já nas etapas iniciais."
+            })
+
+        repeated_scans = self.detect_repeated_scans()
+        if repeated_scans:
+            top = list(repeated_scans.items())[:5]
+            findings.append({
+                "categoria": "Leitura repetida",
+                "severidade": "Média",
+                "titulo": "Tabelas escaneadas múltiplas vezes",
+                "evidencia": f"Principais repetições: {top}",
+                "impacto": "Releituras frequentes podem elevar custo e tempo.",
+                "acao": "Avaliar materialização intermediária, reutilização de subresultado ou simplificação de CTEs."
+            })
+
+        return findings
+
+    # =========================
+    # Recomendações priorizadas
+    # =========================
+    def build_recommendations(self):
+        recs = []
+
+        if self.detect_cross_join():
+            recs.append(("P0", "Revisar imediatamente joins sem condição ou condições insuficientes."))
+
+        if self._count(r"\bSINGLE\b") >= 2:
+            recs.append(("P0", "Reduzir estágios SINGLE: revisar agregações finais globais e sorts finais."))
+
+        if self._count(r"\bExchange\b") >= 5:
+            recs.append(("P1", "Diminuir shuffle: filtrar e agregar antes dos joins mais pesados."))
+
+        if self._count(r"\bWindow\b") >= 2:
+            recs.append(("P1", "Avaliar se todas as window functions são necessárias na mesma etapa."))
+
+        if self._count(r"\bSort\b") >= 2 or self._count(r"\bTopN\b") >= 2:
+            recs.append(("P1", "Reduzir ordenações intermediárias; ordenar apenas no ponto em que isso é estritamente necessário."))
+
+        if self.detect_repeated_scans():
+            recs.append(("P1", "Materializar subconjuntos ou bases intermediárias quando a mesma tabela é lida repetidamente."))
+
+        pruning = self.detect_possible_missing_pruning()
+        if pruning:
+            recs.append(("P0", "Garantir partition pruning nas tabelas grandes, filtrando a partição o mais cedo possível."))
+
+        if self.sql:
+            suspicious_ctes = self.map_suspicious_ctes()
+            if suspicious_ctes:
+                top = suspicious_ctes[:3]
+                recs.append(("P1", f"Inspecionar primeiro as CTEs mais suspeitas: {[x['cte'] for x in top]}."))
+                recs.append(("P2", "Considerar quebrar CTEs muito pesadas em etapas materializadas (CTAS/Iceberg temporário)."))
+
+        if not recs:
+            recs.append(("P2", "Plano sem sinais críticos evidentes; validar com EXPLAIN ANALYZE ou Execution Details do Athena."))
+
+        order = {"P0": 0, "P1": 1, "P2": 2}
+        recs = sorted(recs, key=lambda x: order[x[0]])
+        return [{"prioridade": p, "recomendacao": r} for p, r in recs]
+
+    # =========================
+    # Resumo executivo
+    # =========================
+    def build_executive_summary(self):
+        ops = self.count_operators()
+        risk = self.estimate_cost_risk()
+        tables = self.detect_tables().most_common(10)
+        dist = self.detect_distribution_types()
+        fragments = self.detect_fragments()
+
+        bullets = []
+
+        if risk["nivel"] in ("Alto", "Muito Alto"):
+            bullets.append(
+                f"O plano apresenta risco {risk['nivel'].lower()} de custo/performance, com score heurístico {risk['score']}."
+            )
+        else:
+            bullets.append(
+                f"O plano apresenta risco {risk['nivel'].lower()} de custo/performance, com score heurístico {risk['score']}."
+            )
+
+        if ops["Exchange"] >= 5:
+            bullets.append("Há muitos exchanges, o que sugere redistribuição relevante de dados entre nós.")
+        if dist["SINGLE"] >= 2:
+            bullets.append("Há indícios de gargalo single-node em parte do plano.")
+        if ops["Join"] >= 5:
+            bullets.append("A query possui muitos joins, o que aumenta risco de cardinalidade alta e shuffle.")
+        if ops["Window"] >= 2:
+            bullets.append("Há uso relevante de window functions, potencialmente caras.")
+        if self.detect_cross_join():
+            bullets.append("Foi detectado cross join, ponto mais crítico do plano.")
+        if self.detect_repeated_scans():
+            bullets.append("Há tabelas escaneadas repetidamente, sugerindo possível redundância.")
+
+        if not bullets:
+            bullets.append("O plano não apresenta sinais textuais muito agressivos, mas ainda vale validar runtime real.")
+
+        return {
+            "fragments": fragments,
+            "risco": risk,
+            "principais_pontos": bullets,
+            "top_tabelas_lidas": tables,
+            "operadores": ops,
+            "distribuicao": dist
+        }
+
+    # =========================
+    # Markdown bonito
+    # =========================
+    def to_markdown(self):
+        summary = self.build_executive_summary()
+        findings = self.build_findings()
+        recs = self.build_recommendations()
+        suspicious_ctes = self.map_suspicious_ctes()
+
+        lines = []
+        lines.append("# Relatório de Interpretação de EXPLAIN")
+        lines.append("")
+        lines.append("## Resumo executivo")
+        lines.append("")
+        lines.append(f"- **Fragments detectados:** {summary['fragments']}")
+        lines.append(f"- **Risco heurístico:** {summary['risco']['nivel']} (score {summary['risco']['score']})")
+        lines.append("")
+
+        for p in summary["principais_pontos"]:
+            lines.append(f"- {p}")
+
+        lines.append("")
+        lines.append("## Operadores")
+        lines.append("")
+        for k, v in summary["operadores"].items():
+            lines.append(f"- **{k}:** {v}")
+
+        lines.append("")
+        lines.append("## Distribuição / Exchange")
+        lines.append("")
+        for k, v in summary["distribuicao"].items():
+            lines.append(f"- **{k}:** {v}")
+
+        lines.append("")
+        lines.append("## Tabelas mais lidas")
+        lines.append("")
+        if summary["top_tabelas_lidas"]:
+            for tbl, cnt in summary["top_tabelas_lidas"]:
+                lines.append(f"- `{tbl}` → {cnt} menções")
+        else:
+            lines.append("- Nenhuma tabela identificada textualmente no plano.")
+
+        lines.append("")
+        lines.append("## Achados principais")
+        lines.append("")
+        if findings:
+            for f in findings:
+                lines.append(f"### {f['titulo']}")
+                lines.append(f"- **Categoria:** {f['categoria']}")
+                lines.append(f"- **Severidade:** {f['severidade']}")
+                lines.append(f"- **Evidência:** {f['evidencia']}")
+                lines.append(f"- **Impacto:** {f['impacto']}")
+                lines.append(f"- **Ação sugerida:** {f['acao']}")
+                lines.append("")
+        else:
+            lines.append("- Nenhum achado crítico detectado.")
+            lines.append("")
+
+        lines.append("## Recomendações priorizadas")
+        lines.append("")
+        for r in recs:
+            lines.append(f"- **{r['prioridade']}** — {r['recomendacao']}")
+
+        lines.append("")
+        lines.append("## CTEs suspeitas")
+        lines.append("")
+        if suspicious_ctes:
+            for c in suspicious_ctes:
+                lines.append(
+                    f"- **{c['cte']}** — score {c['score_heurstico']} — motivos: {', '.join(c['motivos'])}"
+                )
+        else:
+            lines.append("- Nenhuma CTE suspeita identificada heurísticamente ou SQL não fornecido.")
+
+        return "\n".join(lines)
+
+    # =========================
+    # JSON final
+    # =========================
+    def to_dict(self):
+        return {
+            "resumo_executivo": self.build_executive_summary(),
+            "achados": self.build_findings(),
+            "recomendacoes": self.build_recommendations(),
+            "ctes_suspeitas": self.map_suspicious_ctes(),
+            "tabelas_repetidas": self.detect_repeated_scans(),
+            "runtime_signals": self.detect_runtime_signals(),
+            "partition_signals": self.detect_partition_signals(),
+        }
+
+explain_text = """
+Query Plan
+Fragment 0 [SINGLE]
+    Output layout: [mesref, escritorio, regional, cluster, tipo_carteira, esteira, bucket_judicial, qtd_contratos, qtd_cnpjs, saldo_total, caixa_total, valor_boletado_total, valor_acordado_total, qtd_contratos_com_pagamento, qtd_contratos_com_acordo_ativo, qtd_contratos_regularizados_status, qtd_liquidacao_total, qtd_liquidacao_parcial, avg_pct_caixa_sobre_saldo, avg_pct_acordo_sobre_saldo, pior_rank_caixa, meta_caixa, meta_regularizacao, pct_comissao, pct_atingimento_meta_caixa, pct_atingimento_meta_regularizacao, valor_comissao_estimado]
+    Output partitioning: SINGLE []
+    Output[columnNames = [mesref, escritorio, regional, cluster, tipo_carteira, esteira, bucket_judicial, qtd_contratos, qtd_cnpjs, saldo_total, caixa_total, valor_boletado_total, valor_acordado_total, qtd_contratos_com_pagamento, qtd_contratos_com_acordo_ativo, qtd_contratos_regularizados_status, qtd_liquidacao_total, qtd_liquidacao_parcial, avg_pct_caixa_sobre_saldo, avg_pct_acordo_sobre_saldo, pior_rank_caixa, meta_caixa, meta_regularizacao, pct_comissao, pct_atingimento_meta_caixa, pct_atingimento_meta_regularizacao, valor_comissao_estimado]]
+    │   Layout: [mesref:integer, escritorio:varchar, regional:varchar, cluster:varchar, tipo_carteira:varchar, esteira:varchar, bucket_judicial:varchar, qtd_contratos:bigint, qtd_cnpjs:bigint, saldo_total:double, caixa_total:double, valor_boletado_total:double, valor_acordado_total:double, qtd_contratos_com_pagamento:bigint, qtd_contratos_com_acordo_ativo:bigint, qtd_contratos_regularizados_status:bigint, qtd_liquidacao_total:bigint, qtd_liquidacao_parcial:bigint, avg_pct_caixa_sobre_saldo:double, avg_pct_acordo_sobre_saldo:double, pior_rank_caixa:bigint, meta_caixa:double, meta_regularizacao:double, pct_comissao:double, pct_atingimento_meta_caixa:double, pct_atingimento_meta_regularizacao:double, valor_comissao_estimado:double]
+    └─ Sort[mesref ASC NULLS LAST, escritorio ASC NULLS LAST, tipo_carteira ASC NULLS LAST, esteira ASC NULLS LAST, bucket_judicial ASC NULLS LAST]
+       │   Layout: [mesref:integer, escritorio:varchar, regional:varchar, cluster:varchar, tipo_carteira:varchar, esteira:varchar, bucket_judicial:varchar, qtd_contratos:bigint, qtd_cnpjs:bigint, saldo_total:double, caixa_total:double, valor_boletado_total:double, valor_acordado_total:double, qtd_contratos_com_pagamento:bigint, qtd_contratos_com_acordo_ativo:bigint, qtd_contratos_regularizados_status:bigint, qtd_liquidacao_total:bigint, qtd_liquidacao_parcial:bigint, avg_pct_caixa_sobre_saldo:double, avg_pct_acordo_sobre_saldo:double, pior_rank_caixa:bigint, meta_caixa:double, meta_regularizacao:double, pct_comissao:double, pct_atingimento_meta_caixa:double, pct_atingimento_meta_regularizacao:double, valor_comissao_estimado:double]
+       └─ LocalExchange[SINGLE]
+          └─ RemoteSource[1]
+
+Fragment 1 [HASH]
+    Output layout: [mesref, escritorio, regional, cluster, tipo_carteira, esteira, bucket_judicial, qtd_contratos, qtd_cnpjs, saldo_total, caixa_total, valor_boletado_total, valor_acordado_total, qtd_contratos_com_pagamento, qtd_contratos_com_acordo_ativo, qtd_contratos_regularizados_status, qtd_liquidacao_total, qtd_liquidacao_parcial, avg_pct_caixa_sobre_saldo, avg_pct_acordo_sobre_saldo, pior_rank_caixa, meta_caixa, meta_regularizacao, pct_comissao]
+    Output partitioning: HASH [mesref, escritorio, tipo_carteira, esteira]
+    └─ Project[]
+       │   Layout: [mesref:integer, escritorio:varchar, regional:varchar, cluster:varchar, tipo_carteira:varchar, esteira:varchar, bucket_judicial:varchar, qtd_contratos:bigint, qtd_cnpjs:bigint, saldo_total:double, caixa_total:double, valor_boletado_total:double, valor_acordado_total:double, qtd_contratos_com_pagamento:bigint, qtd_contratos_com_acordo_ativo:bigint, qtd_contratos_regularizados_status:bigint, qtd_liquidacao_total:bigint, qtd_liquidacao_parcial:bigint, avg_pct_caixa_sobre_saldo:double, avg_pct_acordo_sobre_saldo:double, pior_rank_caixa:bigint, meta_caixa:double, meta_regularizacao:double, pct_comissao:double, expr_1:double, expr_2:double, expr_3:double]
+       └─ Join[LEFT]
+          │   Distribution: PARTITIONED
+          │   Criteria: (mesref = mesref) AND (escritorio = escritorio) AND (tipo_carteira = tipo_carteira) AND (esteira = esteira) AND (COALESCE(cluster, 'SEM_CLUSTER') = COALESCE(cluster, 'SEM_CLUSTER'))
+          │   Layout: [mesref:integer, escritorio:varchar, regional:varchar, cluster:varchar, tipo_carteira:varchar, esteira:varchar, bucket_judicial:varchar, qtd_contratos:bigint, qtd_cnpjs:bigint, saldo_total:double, caixa_total:double, valor_boletado_total:double, valor_acordado_total:double, qtd_contratos_com_pagamento:bigint, qtd_contratos_com_acordo_ativo:bigint, qtd_contratos_regularizados_status:bigint, qtd_liquidacao_total:bigint, qtd_liquidacao_parcial:bigint, avg_pct_caixa_sobre_saldo:double, avg_pct_acordo_sobre_saldo:double, pior_rank_caixa:bigint, meta_caixa:double, meta_regularizacao:double, pct_comissao:double]
+          ├─ RemoteSource[2]
+          └─ LocalExchange[HASH]
+             └─ RemoteSource[3]
+
+Fragment 2 [HASH]
+    Output layout: [mesref, escritorio, regional, cluster, tipo_carteira, esteira, bucket_judicial, qtd_contratos, qtd_cnpjs, saldo_total, caixa_total, valor_boletado_total, valor_acordado_total, qtd_contratos_com_pagamento, qtd_contratos_com_acordo_ativo, qtd_contratos_regularizados_status, qtd_liquidacao_total, qtd_liquidacao_parcial, avg_pct_caixa_sobre_saldo, avg_pct_acordo_sobre_saldo, pior_rank_caixa]
+    Output partitioning: HASH [mesref, escritorio, tipo_carteira, esteira]
+    └─ Aggregate[type = FINAL, keys = [mesref, escritorio, regional, cluster, tipo_carteira, esteira, bucket_judicial]]
+       │   Layout: [mesref:integer, escritorio:varchar, regional:varchar, cluster:varchar, tipo_carteira:varchar, esteira:varchar, bucket_judicial:varchar, qtd_contratos:bigint, qtd_cnpjs:bigint, saldo_total:double, caixa_total:double, valor_boletado_total:double, valor_acordado_total:double, qtd_contratos_com_pagamento:bigint, qtd_contratos_com_acordo_ativo:bigint, qtd_contratos_regularizados_status:bigint, qtd_liquidacao_total:bigint, qtd_liquidacao_parcial:bigint, avg_pct_caixa_sobre_saldo:double, avg_pct_acordo_sobre_saldo:double, pior_rank_caixa:bigint]
+       └─ LocalExchange[HASH]
+          └─ RemoteSource[4]
+
+Fragment 3 [HASH]
+    Output layout: [mesref, escritorio, tipo_carteira, esteira, cluster, meta_caixa, meta_regularizacao, pct_comissao]
+    Output partitioning: HASH [mesref, escritorio, tipo_carteira, esteira]
+    └─ ScanFilterProject[table = remuneracao.meta_escritorio, grouped = false]
+           Layout: [mesref:integer, escritorio:varchar, tipo_carteira:varchar, esteira:varchar, cluster:varchar, meta_caixa:double, meta_regularizacao:double, pct_comissao:double]
+           Estimates: {rows: 1200 (95KB), cpu: 95K, memory: 0B, network: 0B}
+           filterPredicate = ("mesref" >= 202601) AND ("mesref" <= 202603)
+
+Fragment 4 [HASH]
+    Output layout: [mesref, escritorio, regional, cluster, tipo_carteira, esteira, bucket_judicial, saldo_aberto, valor_pago_mes, valor_boletado, valor_acordo_fim_mes, fl_pagou_mes, fl_acordo_ativo, fl_regularizado_status, fl_liquidacao_total, fl_liquidacao_parcial, pct_caixa_sobre_saldo, pct_acordo_sobre_saldo, cnpj, rk_caixa_escritorio_mes]
+    Output partitioning: HASH [mesref, escritorio, regional, cluster, tipo_carteira, esteira, bucket_judicial]
+    └─ Aggregate[type = PARTIAL, keys = [mesref, escritorio, regional, cluster, tipo_carteira, esteira, bucket_judicial]]
+       │   Layout: [mesref:integer, escritorio:varchar, regional:varchar, cluster:varchar, tipo_carteira:varchar, esteira:varchar, bucket_judicial:varchar, count:bigint, count_0:bigint, sum:double, sum_1:double, sum_2:double, sum_3:double, sum_4:bigint, sum_5:bigint, sum_6:bigint, sum_7:bigint, sum_8:bigint, avg:double, avg_0:double, max:bigint]
+       └─ Project[]
+          │   Layout: [mesref:integer, escritorio:varchar, regional:varchar, cluster:varchar, tipo_carteira:varchar, esteira:varchar, bucket_judicial:varchar, saldo_aberto:double, valor_pago_mes:double, valor_boletado:double, valor_acordo_fim_mes:double, fl_pagou_mes:integer, fl_acordo_ativo:integer, fl_regularizado_status:integer, fl_liquidacao_total:integer, fl_liquidacao_parcial:integer, pct_caixa_sobre_saldo:double, pct_acordo_sobre_saldo:double, cnpj:varchar, rk_caixa_escritorio_mes:bigint]
+          └─ Filter[rn_contrato_mes = BIGINT '1']
+             └─ Window[partition by (escritorio, mesref) order by (COALESCE(valor_pago_mes, 0) DESC NULLS LAST)]
+                │   Layout: [contrato:varchar, cnpj:varchar, id_cliente:varchar, escritorio:varchar, tipo_carteira:varchar, esteira:varchar, produto:varchar, segmento:varchar, mesref:integer, anomesdia:integer, saldo_aberto:double, faixa_atraso:varchar, data_inadimplencia:date, data_entrada_carteira:date, uf:varchar, cidade:varchar, regional:varchar, cluster:varchar, tipo_operacao:varchar, porte_empresa:varchar, segmento_macro:varchar, rating:varchar, primeira_data_atraso_mes:date, max_dias_atraso_mes:integer, status_atraso_fim_mes:varchar, valor_pago_mes:double, qtd_pagamentos_mes:bigint, ultima_data_pagamento_mes:integer, qtd_boletos_emitidos:bigint, valor_boletado:double, ultima_emissao_boleto:integer, qtd_eventos_composicao:bigint, ultimo_evento_composicao:varchar, qtd_baixas:bigint, qtd_retroacoes:bigint, ultimo_acordo:varchar, status_acordo_fim_mes:varchar, valor_acordo_fim_mes:double, qtd_parcelas_fim_mes:integer, valor_entrada_fim_mes:double, fl_execucao_ativa:integer, fl_acao_cobranca:integer, ultima_acao_judicial:varchar, rn_contrato_mes:bigint, rk_caixa_escritorio_mes:bigint]
+                └─ Window[partition by (contrato, mesref) order by (COALESCE(valor_pago_mes, 0) DESC NULLS LAST, COALESCE(qtd_pagamentos_mes, 0) DESC NULLS LAST)]
+                   └─ Project[]
+                      └─ Join[LEFT]
+                         │   Distribution: PARTITIONED
+                         │   Criteria: (cnpj = cnpj)
+                         ├─ RemoteSource[5]
+                         └─ LocalExchange[HASH]
+                            └─ RemoteSource[12]
+
+Fragment 5 [HASH]
+    Output layout: [contrato, cnpj, id_cliente, escritorio, tipo_carteira, esteira, produto, segmento, mesref, anomesdia, saldo_aberto, faixa_atraso, data_inadimplencia, data_entrada_carteira, uf, cidade, regional, cluster, tipo_operacao, primeira_data_atraso_mes, max_dias_atraso_mes, status_atraso_fim_mes, valor_pago_mes, qtd_pagamentos_mes, ultima_data_pagamento_mes, qtd_boletos_emitidos, valor_boletado, ultima_emissao_boleto, qtd_eventos_composicao, ultimo_evento_composicao, qtd_baixas, qtd_retroacoes, ultimo_acordo, status_acordo_fim_mes, valor_acordo_fim_mes, qtd_parcelas_fim_mes, valor_entrada_fim_mes, fl_execucao_ativa, fl_acao_cobranca, ultima_acao_judicial]
+    Output partitioning: HASH [cnpj]
+    └─ Join[LEFT]
+       │   Distribution: PARTITIONED
+       │   Criteria: (escritorio = escritorio)
+       ├─ RemoteSource[6]
+       └─ LocalExchange[HASH]
+          └─ RemoteSource[11]
+
+Fragment 6 [HASH]
+    Output layout: [contrato, cnpj, id_cliente, escritorio, tipo_carteira, esteira, produto, segmento, mesref, anomesdia, saldo_aberto, faixa_atraso, data_inadimplencia, data_entrada_carteira, uf, cidade, primeira_data_atraso_mes, max_dias_atraso_mes, status_atraso_fim_mes, valor_pago_mes, qtd_pagamentos_mes, ultima_data_pagamento_mes, qtd_boletos_emitidos, valor_boletado, ultima_emissao_boleto, qtd_eventos_composicao, ultimo_evento_composicao, qtd_baixas, qtd_retroacoes, ultimo_acordo, status_acordo_fim_mes, valor_acordo_fim_mes, qtd_parcelas_fim_mes, valor_entrada_fim_mes, fl_execucao_ativa, fl_acao_cobranca, ultima_acao_judicial]
+    Output partitioning: HASH [escritorio]
+    └─ Join[LEFT]
+       │   Distribution: PARTITIONED
+       │   Criteria: (contrato = contrato) AND (mesref = mesref)
+       ├─ RemoteSource[7]
+       └─ LocalExchange[HASH]
+          └─ RemoteSource[10]
+
+Fragment 7 [HASH]
+    Output layout: [contrato, cnpj, id_cliente, escritorio, tipo_carteira, esteira, produto, segmento, mesref, anomesdia, saldo_aberto, faixa_atraso, data_inadimplencia, data_entrada_carteira, uf, cidade, primeira_data_atraso_mes, max_dias_atraso_mes, status_atraso_fim_mes, valor_pago_mes, qtd_pagamentos_mes, ultima_data_pagamento_mes, qtd_boletos_emitidos, valor_boletado, ultima_emissao_boleto, qtd_eventos_composicao, ultimo_evento_composicao, qtd_baixas, qtd_retroacoes, ultimo_acordo, status_acordo_fim_mes, valor_acordo_fim_mes, qtd_parcelas_fim_mes, valor_entrada_fim_mes]
+    Output partitioning: HASH [contrato]
+    └─ Join[LEFT]
+       │   Distribution: PARTITIONED
+       │   Criteria: (contrato = contrato) AND (escritorio = escritorio) AND (mesref = mesref)
+       ├─ RemoteSource[8]
+       └─ LocalExchange[HASH]
+          └─ RemoteSource[9]
+
+Fragment 8 [HASH]
+    Output layout: [contrato, cnpj, id_cliente, escritorio, tipo_carteira, esteira, produto, segmento, mesref, anomesdia, saldo_aberto, faixa_atraso, data_inadimplencia, data_entrada_carteira, uf, cidade, primeira_data_atraso_mes, max_dias_atraso_mes, status_atraso_fim_mes, valor_pago_mes, qtd_pagamentos_mes, ultima_data_pagamento_mes]
+    Output partitioning: HASH [contrato]
+    └─ Join[LEFT]
+       │   Distribution: PARTITIONED
+       │   Criteria: (contrato = contrato) AND (escritorio = escritorio) AND (mesref = mesref)
+       ├─ RemoteSource[13]
+       └─ LocalExchange[HASH]
+          └─ RemoteSource[14]
+
+Fragment 9 [HASH]
+    Output layout: [contrato, escritorio, mesref, qtd_boletos_emitidos, valor_boletado, ultima_emissao_boleto]
+    Output partitioning: HASH [contrato]
+    └─ Aggregate[type = FINAL, keys = [contrato, escritorio, mesref]]
+       └─ LocalExchange[HASH]
+          └─ RemoteSource[15]
+
+Fragment 10 [HASH]
+    Output layout: [contrato, escritorio, mesref, qtd_eventos_composicao, ultimo_evento_composicao, qtd_baixas, qtd_retroacoes]
+    Output partitioning: HASH [contrato]
+    └─ Aggregate[type = FINAL, keys = [contrato, escritorio, mesref]]
+       └─ LocalExchange[HASH]
+          └─ RemoteSource[16]
+
+Fragment 11 [HASH]
+    Output layout: [escritorio, regional, cluster, tipo_operacao]
+    Output partitioning: HASH [escritorio]
+    └─ ScanFilterProject[table = corporativo.dim_escritorio, grouped = false]
+           Layout: [escritorio:varchar, regional:varchar, cluster:varchar, tipo_operacao:varchar]
+           Estimates: {rows: 300 (18KB), cpu: 18K, memory: 0B, network: 0B}
+
+Fragment 12 [HASH]
+    Output layout: [cnpj, porte_empresa, segmento_macro, rating, uf_cliente]
+    Output partitioning: HASH [cnpj]
+    └─ ScanFilterProject[table = clientes.dim_cliente, grouped = false]
+           Layout: [cnpj:varchar, porte_empresa:varchar, segmento_macro:varchar, rating:varchar, uf_cliente:varchar]
+           Estimates: {rows: 4000000 (480MB), cpu: 480M, memory: 0B, network: 0B}
+
+Fragment 13 [HASH]
+    Output layout: [contrato, cnpj, id_cliente, escritorio, tipo_carteira, esteira, produto, segmento, mesref, anomesdia, saldo_aberto, faixa_atraso, data_inadimplencia, data_entrada_carteira, uf, cidade, primeira_data_atraso_mes, max_dias_atraso_mes, status_atraso_fim_mes]
+    Output partitioning: HASH [contrato]
+    └─ Join[LEFT]
+       │   Distribution: PARTITIONED
+       │   Criteria: (contrato = contrato) AND (mesref = mesref)
+       ├─ RemoteSource[17]
+       └─ LocalExchange[HASH]
+          └─ RemoteSource[18]
+
+Fragment 14 [HASH]
+    Output layout: [contrato, escritorio, mesref, valor_pago_mes, qtd_pagamentos_mes, ultima_data_pagamento_mes]
+    Output partitioning: HASH [contrato]
+    └─ Aggregate[type = FINAL, keys = [contrato, escritorio, mesref]]
+       └─ LocalExchange[HASH]
+          └─ RemoteSource[19]
+
+Fragment 15 [HASH]
+    Output layout: [contrato, escritorio, mesref, qtd_boletos_emitidos, valor_boletado, ultima_emissao_boleto]
+    Output partitioning: HASH [contrato]
+    └─ Aggregate[type = PARTIAL, keys = [contrato, escritorio, mesref]]
+       └─ Project[]
+          └─ ScanFilterProject[table = cobranca.base_boletos, grouped = false]
+                 Layout: [contrato:varchar, escritorio:varchar, mesref:integer, id_boleto:varchar, valor_boleto:double, anomesdia:integer, status_boleto:varchar]
+                 Estimates: {rows: 185000000 (14GB), cpu: 14G, memory: 0B, network: 0B}
+                 filterPredicate = ("mesref" >= 202601) AND ("mesref" <= 202603) AND ("status_boleto" IN ('EMITIDO', 'PAGO', 'VENCIDO'))
+
+Fragment 16 [HASH]
+    Output layout: [contrato, escritorio, mesref, qtd_eventos_composicao, ultimo_evento_composicao, qtd_baixas, qtd_retroacoes]
+    Output partitioning: HASH [contrato]
+    └─ Aggregate[type = PARTIAL, keys = [contrato, escritorio, mesref]]
+       └─ Project[]
+          └─ ScanFilterProject[table = cobranca.base_composicao, grouped = false]
+                 Layout: [contrato:varchar, escritorio:varchar, mesref:integer, tipo_evento:varchar, anomesdia:integer]
+                 Estimates: {rows: 240000000 (16GB), cpu: 16G, memory: 0B, network: 0B}
+                 filterPredicate = ("mesref" >= 202601) AND ("mesref" <= 202603)
+
+Fragment 17 [HASH]
+    Output layout: [contrato, cnpj, id_cliente, escritorio, tipo_carteira, esteira, produto, segmento, mesref, anomesdia, saldo_aberto, faixa_atraso, data_inadimplencia, data_entrada_carteira, uf, cidade]
+    Output partitioning: HASH [contrato]
+    └─ ScanFilterProject[table = cobranca.base_contratos, grouped = false]
+           Layout: [contrato:varchar, cnpj:varchar, id_cliente:varchar, escritorio:varchar, tipo_carteira:varchar, esteira:varchar, produto:varchar, segmento:varchar, mesref:integer, anomesdia:integer, saldo_aberto:double, faixa_atraso:varchar, data_inadimplencia:date, data_entrada_carteira:date, uf:varchar, cidade:varchar]
+           Estimates: {rows: 98000000 (11GB), cpu: 11G, memory: 0B, network: 0B}
+           filterPredicate = ("mesref" >= 202601) AND ("mesref" <= 202603) AND ("tipo_carteira" IN ('ATIVO', 'WO'))
+
+Fragment 18 [HASH]
+    Output layout: [contrato, mesref, primeira_data_atraso_mes, max_dias_atraso_mes, status_atraso_fim_mes]
+    Output partitioning: HASH [contrato]
+    └─ Aggregate[type = FINAL, keys = [contrato, mesref]]
+       └─ LocalExchange[HASH]
+          └─ RemoteSource[20]
+
+Fragment 19 [HASH]
+    Output layout: [contrato, escritorio, mesref, valor_pago_mes, qtd_pagamentos_mes, ultima_data_pagamento_mes]
+    Output partitioning: HASH [contrato]
+    └─ Aggregate[type = PARTIAL, keys = [contrato, escritorio, mesref]]
+       └─ Aggregate[type = FINAL, keys = [contrato, escritorio, anomesdia, mesref]]
+          └─ LocalExchange[HASH]
+             └─ RemoteSource[21]
+
+Fragment 20 [HASH]
+    Output layout: [contrato, mesref, primeira_data_atraso_mes, max_dias_atraso_mes, status_atraso_fim_mes]
+    Output partitioning: HASH [contrato]
+    └─ Aggregate[type = PARTIAL, keys = [contrato, mesref]]
+       └─ Project[]
+          └─ ScanFilterProject[table = cobranca.hist_atraso, grouped = false]
+                 Layout: [contrato:varchar, mesref:integer, data_atraso:date, dias_atraso:integer, status_atraso:varchar, anomesdia:integer]
+                 Estimates: {rows: 310000000 (19GB), cpu: 19G, memory: 0B, network: 0B}
+                 filterPredicate = ("mesref" >= 202601) AND ("mesref" <= 202603)
+
+Fragment 21 [HASH]
+    Output layout: [contrato, escritorio, anomesdia, mesref, valor_pago_dia, qtd_pagamentos_dia]
+    Output partitioning: HASH [contrato]
+    └─ Aggregate[type = PARTIAL, keys = [contrato, escritorio, anomesdia, mesref]]
+       └─ Project[]
+          └─ ScanFilterProject[table = financeiro.base_pagamentos, grouped = false]
+                 Layout: [contrato:varchar, escritorio:varchar, anomesdia:integer, mesref:integer, valor_pago:double, status_pagamento:varchar]
+                 Estimates: {rows: 420000000 (27GB), cpu: 27G, memory: 0B, network: 0B}
+                 filterPredicate = ("mesref" >= 202601) AND ("mesref" <= 202603) AND ("status_pagamento" = 'LIQUIDADO')
+
+Fragment 22 [HASH]
+    Output layout: [contrato, escritorio, mesref, ultimo_acordo, status_acordo_fim_mes, valor_acordo_fim_mes, qtd_parcelas_fim_mes, valor_entrada_fim_mes]
+    Output partitioning: HASH [contrato]
+    └─ Aggregate[type = PARTIAL, keys = [contrato, escritorio, mesref]]
+       └─ Project[]
+          └─ ScanFilterProject[table = cobranca.base_acordos, grouped = false]
+                 Layout: [contrato:varchar, escritorio:varchar, mesref:integer, id_acordo:varchar, status_acordo:varchar, valor_acordo:double, qtd_parcelas:integer, valor_entrada:double, anomesdia:integer]
+                 Estimates: {rows: 96000000 (8GB), cpu: 8G, memory: 0B, network: 0B}
+                 filterPredicate = ("mesref" >= 202601) AND ("mesref" <= 202603)
+
+Fragment 23 [HASH]
+    Output layout: [contrato, mesref, fl_execucao_ativa, fl_acao_cobranca, ultima_acao_judicial]
+    Output partitioning: HASH [contrato]
+    └─ Aggregate[type = PARTIAL, keys = [contrato, mesref]]
+       └─ Project[]
+          └─ ScanFilterProject[table = juridico.base_processos, grouped = false]
+                 Layout: [contrato:varchar, mesref:integer, nome_acao:varchar, status_processo:varchar, anomesdia:integer]
+                 Estimates: {rows: 54000000 (5GB), cpu: 5G, memory: 0B, network: 0B}
+                 filterPredicate = ("mesref" >= 202601) AND ("mesref" <= 202603) AND ("status_processo" = 'ATIVO')
+
+Fragment 24 [HASH]
+    Output layout: [contrato, escritorio, mesref, ultimo_acordo, status_acordo_fim_mes, valor_acordo_fim_mes, qtd_parcelas_fim_mes, valor_entrada_fim_mes]
+    Output partitioning: HASH [contrato]
+    └─ Aggregate[type = FINAL, keys = [contrato, escritorio, mesref]]
+       └─ LocalExchange[HASH]
+          └─ RemoteSource[22]
+
+Fragment 25 [HASH]
+    Output layout: [contrato, mesref, fl_execucao_ativa, fl_acao_cobranca, ultima_acao_judicial]
+    Output partitioning: HASH [contrato]
+    └─ Aggregate[type = FINAL, keys = [contrato, mesref]]
+       └─ LocalExchange[HASH]
+          └─ RemoteSource[23]
+
+Fragment 26 [HASH]
+    Output layout: [contrato, cnpj, id_cliente, escritorio, tipo_carteira, esteira, produto, segmento, mesref, anomesdia, saldo_aberto, faixa_atraso, data_inadimplencia, data_entrada_carteira, uf, cidade, primeira_data_atraso_mes, max_dias_atraso_mes, status_atraso_fim_mes, valor_pago_mes, qtd_pagamentos_mes, ultima_data_pagamento_mes, qtd_boletos_emitidos, valor_boletado, ultima_emissao_boleto, qtd_eventos_composicao, ultimo_evento_composicao, qtd_baixas, qtd_retroacoes, ultimo_acordo, status_acordo_fim_mes, valor_acordo_fim_mes, qtd_parcelas_fim_mes, valor_entrada_fim_mes, fl_execucao_ativa, fl_acao_cobranca, ultima_acao_judicial]
+    Output partitioning: HASH [contrato]
+    └─ Join[LEFT]
+       │   Distribution: PARTITIONED
+       │   Criteria: (contrato = contrato) AND (mesref = mesref)
+       ├─ RemoteSource[7]
+       └─ LocalExchange[HASH]
+          └─ RemoteSource[24]
+
+Fragment 27 [HASH]
+    Output layout: [contrato, cnpj, id_cliente, escritorio, tipo_carteira, esteira, produto, segmento, mesref, anomesdia, saldo_aberto, faixa_atraso, data_inadimplencia, data_entrada_carteira, uf, cidade, primeira_data_atraso_mes, max_dias_atraso_mes, status_atraso_fim_mes, valor_pago_mes, qtd_pagamentos_mes, ultima_data_pagamento_mes, qtd_boletos_emitidos, valor_boletado, ultima_emissao_boleto, qtd_eventos_composicao, ultimo_evento_composicao, qtd_baixas, qtd_retroacoes, ultimo_acordo, status_acordo_fim_mes, valor_acordo_fim_mes, qtd_parcelas_fim_mes, valor_entrada_fim_mes, fl_execucao_ativa, fl_acao_cobranca, ultima_acao_judicial, regional, cluster, tipo_operacao, porte_empresa, segmento_macro, rating]
+    Output partitioning: HASH [mesref, escritorio, regional, cluster, tipo_carteira, esteira, bucket_judicial]
+    └─ Project[]
+       └─ Join[LEFT]
+          │   Distribution: PARTITIONED
+          │   Criteria: (contrato = contrato) AND (mesref = mesref)
+          ├─ RemoteSource[26]
+          └─ LocalExchange[HASH]
+             └─ RemoteSource[25]
+        """
+
+sql_text = """
+WITH contratos_base AS (
+    SELECT
+        c.contrato,
+        c.cnpj,
+        c.id_cliente,
+        c.escritorio,
+        c.tipo_carteira,
+        c.esteira,
+        c.produto,
+        c.segmento,
+        c.mesref,
+        c.anomesdia,
+        c.saldo_aberto,
+        c.faixa_atraso,
+        c.data_inadimplencia,
+        c.data_entrada_carteira,
+        c.uf,
+        c.cidade
+    FROM cobranca.base_contratos c
+    WHERE c.mesref BETWEEN 202601 AND 202603
+      AND c.tipo_carteira IN ('ATIVO', 'WO')
+),
+
+historico_atraso AS (
+    SELECT
+        h.contrato,
+        h.mesref,
+        MIN(h.data_atraso) AS primeira_data_atraso_mes,
+        MAX(h.dias_atraso) AS max_dias_atraso_mes,
+        MAX_BY(h.status_atraso, h.anomesdia) AS status_atraso_fim_mes
+    FROM cobranca.hist_atraso h
+    WHERE h.mesref BETWEEN 202601 AND 202603
+    GROUP BY
+        h.contrato,
+        h.mesref
+),
+
+pagamentos_dia AS (
+    SELECT
+        p.contrato,
+        p.escritorio,
+        p.anomesdia,
+        p.mesref,
+        SUM(p.valor_pago) AS valor_pago_dia,
+        COUNT(*) AS qtd_pagamentos_dia
+    FROM financeiro.base_pagamentos p
+    WHERE p.mesref BETWEEN 202601 AND 202603
+      AND p.status_pagamento = 'LIQUIDADO'
+    GROUP BY
+        p.contrato,
+        p.escritorio,
+        p.anomesdia,
+        p.mesref
+),
+
+pagamentos_mes AS (
+    SELECT
+        p.contrato,
+        p.escritorio,
+        p.mesref,
+        SUM(p.valor_pago_dia) AS valor_pago_mes,
+        SUM(p.qtd_pagamentos_dia) AS qtd_pagamentos_mes,
+        MAX(p.anomesdia) AS ultima_data_pagamento_mes
+    FROM pagamentos_dia p
+    GROUP BY
+        p.contrato,
+        p.escritorio,
+        p.mesref
+),
+
+boletos_emitidos AS (
+    SELECT
+        b.contrato,
+        b.escritorio,
+        b.mesref,
+        COUNT(DISTINCT b.id_boleto) AS qtd_boletos_emitidos,
+        SUM(b.valor_boleto) AS valor_boletado,
+        MAX(b.anomesdia) AS ultima_emissao_boleto
+    FROM cobranca.base_boletos b
+    WHERE b.mesref BETWEEN 202601 AND 202603
+      AND b.status_boleto IN ('EMITIDO', 'PAGO', 'VENCIDO')
+    GROUP BY
+        b.contrato,
+        b.escritorio,
+        b.mesref
+),
+
+composicao_eventos AS (
+    SELECT
+        x.contrato,
+        x.escritorio,
+        x.mesref,
+        COUNT(*) AS qtd_eventos_composicao,
+        MAX_BY(x.tipo_evento, x.anomesdia) AS ultimo_evento_composicao,
+        SUM(CASE WHEN x.tipo_evento = 'BAIXA' THEN 1 ELSE 0 END) AS qtd_baixas,
+        SUM(CASE WHEN x.tipo_evento = 'RETROACAO_ATRASO' THEN 1 ELSE 0 END) AS qtd_retroacoes
+    FROM cobranca.base_composicao x
+    WHERE x.mesref BETWEEN 202601 AND 202603
+    GROUP BY
+        x.contrato,
+        x.escritorio,
+        x.mesref
+),
+
+acordos_mes AS (
+    SELECT
+        a.contrato,
+        a.escritorio,
+        a.mesref,
+        MAX_BY(a.id_acordo, a.anomesdia) AS ultimo_acordo,
+        MAX_BY(a.status_acordo, a.anomesdia) AS status_acordo_fim_mes,
+        MAX_BY(a.valor_acordo, a.anomesdia) AS valor_acordo_fim_mes,
+        MAX_BY(a.qtd_parcelas, a.anomesdia) AS qtd_parcelas_fim_mes,
+        MAX_BY(a.valor_entrada, a.anomesdia) AS valor_entrada_fim_mes
+    FROM cobranca.base_acordos a
+    WHERE a.mesref BETWEEN 202601 AND 202603
+    GROUP BY
+        a.contrato,
+        a.escritorio,
+        a.mesref
+),
+
+juridico_ativo AS (
+    SELECT
+        j.contrato,
+        j.mesref,
+        MAX(
+            CASE
+                WHEN UPPER(j.nome_acao) LIKE '%EXECUCAO%' THEN 1
+                ELSE 0
+            END
+        ) AS fl_execucao_ativa,
+        MAX(
+            CASE
+                WHEN UPPER(j.nome_acao) LIKE '%COBRANCA%' THEN 1
+                ELSE 0
+            END
+        ) AS fl_acao_cobranca,
+        MAX_BY(j.nome_acao, j.anomesdia) AS ultima_acao_judicial
+    FROM juridico.base_processos j
+    WHERE j.mesref BETWEEN 202601 AND 202603
+      AND j.status_processo = 'ATIVO'
+    GROUP BY
+        j.contrato,
+        j.mesref
+),
+
+dim_escritorio AS (
+    SELECT
+        e.escritorio,
+        e.regional,
+        e.cluster,
+        e.tipo_operacao
+    FROM corporativo.dim_escritorio e
+),
+
+dim_cliente AS (
+    SELECT
+        d.cnpj,
+        d.porte_empresa,
+        d.segmento_macro,
+        d.rating,
+        d.uf AS uf_cliente
+    FROM clientes.dim_cliente d
+),
+
+contrato_enriquecido AS (
+    SELECT
+        c.contrato,
+        c.cnpj,
+        c.id_cliente,
+        c.escritorio,
+        c.tipo_carteira,
+        c.esteira,
+        c.produto,
+        c.segmento,
+        c.mesref,
+        c.anomesdia,
+        c.saldo_aberto,
+        c.faixa_atraso,
+        c.data_inadimplencia,
+        c.data_entrada_carteira,
+        c.uf,
+        c.cidade,
+        de.regional,
+        de.cluster,
+        de.tipo_operacao,
+        dc.porte_empresa,
+        dc.segmento_macro,
+        dc.rating,
+        ha.primeira_data_atraso_mes,
+        ha.max_dias_atraso_mes,
+        ha.status_atraso_fim_mes,
+        pm.valor_pago_mes,
+        pm.qtd_pagamentos_mes,
+        pm.ultima_data_pagamento_mes,
+        be.qtd_boletos_emitidos,
+        be.valor_boletado,
+        be.ultima_emissao_boleto,
+        ce.qtd_eventos_composicao,
+        ce.ultimo_evento_composicao,
+        ce.qtd_baixas,
+        ce.qtd_retroacoes,
+        am.ultimo_acordo,
+        am.status_acordo_fim_mes,
+        am.valor_acordo_fim_mes,
+        am.qtd_parcelas_fim_mes,
+        am.valor_entrada_fim_mes,
+        ja.fl_execucao_ativa,
+        ja.fl_acao_cobranca,
+        ja.ultima_acao_judicial
+    FROM contratos_base c
+    LEFT JOIN historico_atraso ha
+        ON c.contrato = ha.contrato
+       AND c.mesref = ha.mesref
+    LEFT JOIN pagamentos_mes pm
+        ON c.contrato = pm.contrato
+       AND c.escritorio = pm.escritorio
+       AND c.mesref = pm.mesref
+    LEFT JOIN boletos_emitidos be
+        ON c.contrato = be.contrato
+       AND c.escritorio = be.escritorio
+       AND c.mesref = be.mesref
+    LEFT JOIN composicao_eventos ce
+        ON c.contrato = ce.contrato
+       AND c.escritorio = ce.escritorio
+       AND c.mesref = ce.mesref
+    LEFT JOIN acordos_mes am
+        ON c.contrato = am.contrato
+       AND c.escritorio = am.escritorio
+       AND c.mesref = am.mesref
+    LEFT JOIN juridico_ativo ja
+        ON c.contrato = ja.contrato
+       AND c.mesref = ja.mesref
+    LEFT JOIN dim_escritorio de
+        ON c.escritorio = de.escritorio
+    LEFT JOIN dim_cliente dc
+        ON c.cnpj = dc.cnpj
+),
+
+contrato_metrificado AS (
+    SELECT
+        x.*,
+        CASE
+            WHEN COALESCE(x.valor_pago_mes, 0) > 0 THEN 1
+            ELSE 0
+        END AS fl_pagou_mes,
+        CASE
+            WHEN COALESCE(x.valor_entrada_fim_mes, 0) > 0 THEN 1
+            ELSE 0
+        END AS fl_entrada_acordo,
+        CASE
+            WHEN COALESCE(x.valor_pago_mes, 0) >= COALESCE(x.saldo_aberto, 0) THEN 1
+            ELSE 0
+        END AS fl_liquidacao_total,
+        CASE
+            WHEN COALESCE(x.valor_pago_mes, 0) > 0
+             AND COALESCE(x.valor_pago_mes, 0) < COALESCE(x.saldo_aberto, 0) THEN 1
+            ELSE 0
+        END AS fl_liquidacao_parcial,
+        CASE
+            WHEN x.status_acordo_fim_mes IN ('ATIVO', 'FORMALIZADO') THEN 1
+            ELSE 0
+        END AS fl_acordo_ativo,
+        CASE
+            WHEN x.status_atraso_fim_mes IN ('QUITADO', 'COLOCADO_EM_DIA', 'RENEGOCIADO') THEN 1
+            ELSE 0
+        END AS fl_regularizado_status,
+        CASE
+            WHEN x.fl_execucao_ativa = 1 THEN 'EXECUCAO'
+            WHEN x.fl_acao_cobranca = 1 THEN 'COBRANCA_JUDICIAL'
+            ELSE 'SEM_JUDICIAL'
+        END AS bucket_judicial,
+        COALESCE(x.valor_pago_mes, 0) / NULLIF(COALESCE(x.saldo_aberto, 0), 0) AS pct_caixa_sobre_saldo,
+        COALESCE(x.valor_acordo_fim_mes, 0) / NULLIF(COALESCE(x.saldo_aberto, 0), 0) AS pct_acordo_sobre_saldo,
+        ROW_NUMBER() OVER (
+            PARTITION BY x.contrato, x.mesref
+            ORDER BY COALESCE(x.valor_pago_mes, 0) DESC, COALESCE(x.qtd_pagamentos_mes, 0) DESC
+        ) AS rn_contrato_mes,
+        DENSE_RANK() OVER (
+            PARTITION BY x.escritorio, x.mesref
+            ORDER BY COALESCE(x.valor_pago_mes, 0) DESC
+        ) AS rk_caixa_escritorio_mes
+    FROM contrato_enriquecido x
+),
+
+contrato_metrificado_filtrado AS (
+    SELECT
+        *
+    FROM contrato_metrificado
+    WHERE rn_contrato_mes = 1
+),
+
+agregado_escritorio_mes AS (
+    SELECT
+        mesref,
+        escritorio,
+        regional,
+        cluster,
+        tipo_carteira,
+        esteira,
+        bucket_judicial,
+        COUNT(*) AS qtd_contratos,
+        COUNT(DISTINCT cnpj) AS qtd_cnpjs,
+        SUM(saldo_aberto) AS saldo_total,
+        SUM(COALESCE(valor_pago_mes, 0)) AS caixa_total,
+        SUM(COALESCE(valor_boletado, 0)) AS valor_boletado_total,
+        SUM(COALESCE(valor_acordo_fim_mes, 0)) AS valor_acordado_total,
+        SUM(CASE WHEN fl_pagou_mes = 1 THEN 1 ELSE 0 END) AS qtd_contratos_com_pagamento,
+        SUM(CASE WHEN fl_acordo_ativo = 1 THEN 1 ELSE 0 END) AS qtd_contratos_com_acordo_ativo,
+        SUM(CASE WHEN fl_regularizado_status = 1 THEN 1 ELSE 0 END) AS qtd_contratos_regularizados_status,
+        SUM(CASE WHEN fl_liquidacao_total = 1 THEN 1 ELSE 0 END) AS qtd_liquidacao_total,
+        SUM(CASE WHEN fl_liquidacao_parcial = 1 THEN 1 ELSE 0 END) AS qtd_liquidacao_parcial,
+        AVG(COALESCE(pct_caixa_sobre_saldo, 0)) AS avg_pct_caixa_sobre_saldo,
+        AVG(COALESCE(pct_acordo_sobre_saldo, 0)) AS avg_pct_acordo_sobre_saldo,
+        MAX(rk_caixa_escritorio_mes) AS pior_rank_caixa
+    FROM contrato_metrificado_filtrado
+    GROUP BY
+        mesref,
+        escritorio,
+        regional,
+        cluster,
+        tipo_carteira,
+        esteira,
+        bucket_judicial
+),
+
+meta_comissao AS (
+    SELECT
+        m.mesref,
+        m.escritorio,
+        m.tipo_carteira,
+        m.esteira,
+        m.cluster,
+        m.meta_caixa,
+        m.meta_regularizacao,
+        m.pct_comissao
+    FROM remuneracao.meta_escritorio m
+    WHERE m.mesref BETWEEN 202601 AND 202603
+),
+
+resultado_final AS (
+    SELECT
+        a.mesref,
+        a.escritorio,
+        a.regional,
+        a.cluster,
+        a.tipo_carteira,
+        a.esteira,
+        a.bucket_judicial,
+        a.qtd_contratos,
+        a.qtd_cnpjs,
+        a.saldo_total,
+        a.caixa_total,
+        a.valor_boletado_total,
+        a.valor_acordado_total,
+        a.qtd_contratos_com_pagamento,
+        a.qtd_contratos_com_acordo_ativo,
+        a.qtd_contratos_regularizados_status,
+        a.qtd_liquidacao_total,
+        a.qtd_liquidacao_parcial,
+        a.avg_pct_caixa_sobre_saldo,
+        a.avg_pct_acordo_sobre_saldo,
+        a.pior_rank_caixa,
+        m.meta_caixa,
+        m.meta_regularizacao,
+        m.pct_comissao,
+        a.caixa_total / NULLIF(m.meta_caixa, 0) AS pct_atingimento_meta_caixa,
+        a.valor_acordado_total / NULLIF(m.meta_regularizacao, 0) AS pct_atingimento_meta_regularizacao,
+        a.caixa_total * COALESCE(m.pct_comissao, 0) AS valor_comissao_estimado
+    FROM agregado_escritorio_mes a
+    LEFT JOIN meta_comissao m
+        ON a.mesref = m.mesref
+       AND a.escritorio = m.escritorio
+       AND a.tipo_carteira = m.tipo_carteira
+       AND a.esteira = m.esteira
+       AND COALESCE(a.cluster, 'SEM_CLUSTER') = COALESCE(m.cluster, 'SEM_CLUSTER')
+)
+
+SELECT
+    *
+FROM resultado_final
+ORDER BY
+    mesref,
+    escritorio,
+    tipo_carteira,
+    esteira,
+    bucket_judicial;
+"""
+
+
+interpreter = AthenaExplainInterpreterV4(explain_text=explain_text, sql_text=sql_text)
+
+report = interpreter.to_dict()
+
+print(json.dumps(report, indent=2, ensure_ascii=False))
