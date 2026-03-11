@@ -1,0 +1,284 @@
+# 🧩 Kanban Dashboard
+
+## 🔥 WIP atual em Doing
+
+```markdown
+TABLE WITHOUT ID
+text AS "Tarefa",
+kanban_prioridade AS "Prioridade",
+kanban_due AS "Prazo",
+kanban_pedido AS "Pedido",
+kanban_macrotarefa AS "Macrotarefa"
+FROM "Kanban"
+FLATTEN file.tasks AS T
+WHERE !T.completed
+AND T.kanban_status = "doing"
+SORT T.kanban_prioridade DESC, T.kanban_due ASC
+```
+## 📌 Backlog
+
+TASK  
+FROM "Kanban"  
+WHERE !completed  
+AND kanban_status = "backlog"  
+SORT kanban_prioridade DESC, kanban_due ASC
+
+## 🚧 Doing
+
+TASK  
+FROM "Kanban"  
+WHERE !completed  
+AND kanban_status = "doing"  
+SORT kanban_prioridade DESC, kanban_due ASC
+
+## ⛔ Blocked
+
+TASK  
+FROM "Kanban"  
+WHERE !completed  
+AND kanban_status = "blocked"  
+SORT kanban_prioridade DESC, kanban_due ASC
+
+## ✅ Done (últimas 20)
+
+TASK  
+FROM "Kanban"  
+WHERE completed  
+OR kanban_status = "done"  
+SORT file.name DESC  
+LIMIT 20
+
+  
+---  
+  
+# 4) Dashboard de tarefas atrasadas  
+  
+```markdown  
+# ⏰ Tarefas atrasadas  
+  
+```dataview  
+TASK  
+FROM "Kanban"  
+WHERE !completed  
+AND kanban_due != null  
+AND kanban_due < date(today)  
+SORT kanban_due ASC, kanban_prioridade DESC
+
+  
+---  
+  
+# 5) Dashboard de próximos 7 dias  
+  
+```markdown  
+# 📅 Próximos 7 dias  
+  
+```dataview  
+TASK  
+FROM "Kanban"  
+WHERE !completed  
+AND kanban_due != null  
+AND kanban_due <= date(today) + dur(7 days)  
+SORT kanban_due ASC, kanban_prioridade DESC
+
+  
+---  
+  
+# 6) WIP limit para Doing  
+  
+Uma forma simples é criar um card de controle:  
+  
+```markdown  
+# 🚦 Controle de WIP  
+  
+```dataview  
+TABLE length(rows) AS "Qtd em Doing"  
+FROM "Kanban"  
+FLATTEN file.tasks AS T  
+WHERE !T.completed  
+AND T.kanban_status = "doing"  
+GROUP BY "Doing"
+
+  
+Regra prática:  
+  
+- até **3 tarefas em doing**: saudável  
+- 4 ou mais: risco de dispersão  
+- 6 ou mais: provavelmente trabalho demais em paralelo  
+  
+Se quiser, você pode colocar um bloco logo abaixo:  
+  
+```markdown  
+> Regra: não puxar item novo para Doing se já houver 3 itens em andamento, salvo urgência real.
+
+---
+
+# 7) Visão por prioridade
+
+# 🔺 Prioridade alta  
+  
+```dataview  
+TASK  
+FROM "Kanban"  
+WHERE !completed  
+AND kanban_prioridade = "alta"  
+SORT kanban_due ASC
+
+  
+---  
+  
+# 8) Visão por macrotarefa  
+  
+```markdown  
+# 🧱 Por macrotarefa  
+  
+```dataview  
+TABLE rows.text AS "Tarefas"  
+FROM "Kanban"  
+FLATTEN file.tasks AS T  
+WHERE !T.completed  
+GROUP BY T.kanban_macrotarefa  
+SORT key ASC
+
+  
+---  
+  
+# 9) Visão por pedido  
+  
+```markdown  
+# 🎫 Por pedido  
+  
+```dataview  
+TABLE rows.text AS "Tarefas"  
+FROM "Kanban"  
+FLATTEN file.tasks AS T  
+WHERE !T.completed  
+AND T.kanban_pedido != null  
+GROUP BY T.kanban_pedido  
+SORT key ASC
+
+  
+---  
+  
+# 10) Visão por tabela afetada  
+  
+Isso é muito útil no seu contexto de analista.  
+  
+```markdown  
+# 🗄 Por tabela  
+  
+```dataview  
+TABLE rows.text AS "Tarefas"  
+FROM "Kanban"  
+FLATTEN file.tasks AS T  
+WHERE !T.completed  
+AND T.kanban_tabela != null  
+GROUP BY T.kanban_tabela  
+SORT key ASC
+
+  
+---  
+  
+# 11) Campos sugeridos para seu contexto  
+  
+Além dos que você já definiu, eu sugiro estes:  
+  
+| campo | uso |  
+|---|---|  
+| `kanban_motivo` | motivo do bloqueio |  
+| `kanban_dependencia` | pessoa/time/base dependente |  
+| `kanban_tempo_estimado` | estimativa |  
+| `kanban_tempo_gasto` | esforço real |  
+| `kanban_contexto` | resumo do problema |  
+| `kanban_tipo` | análise / bug / documentação / alinhamento |  
+| `kanban_ambiente` | prod / dev / homolog |  
+| `kanban_mesref` | mês de referência |  
+| `kanban_escritorio` | escritório de cobrança |  
+| `kanban_contrato` | contrato quando necessário |  
+| `kanban_origem` | daily / reunião / e-mail / gestor |  
+  
+---  
+  
+# 12) Convenção recomendada de preenchimento  
+  
+Use valores padronizados:  
+  
+```text  
+kanban_status:: backlog | doing | blocked | done  
+kanban_prioridade:: alta | media | baixa  
+kanban_impacto:: alto | medio | baixo  
+kanban_tipo:: analise | bug | documentacao | alinhamento  
+kanban_ambiente:: prod | dev | homolog
+
+Isso evita fragmentação tipo:
+
+- `Alta`
+    
+- `alta`
+    
+- `ALTA`
+    
+
+---
+
+# 13) Melhor formato de tarefa
+
+Eu recomendo este padrão:
+
+- [ ] validar tabela de pagamentos  
+  kanban_status:: backlog  
+  kanban_prioridade:: alta  
+  kanban_due:: 2026-03-12  
+  kanban_pedido:: PED-4213  
+  kanban_macrotarefa:: [[retroacao_carteira]]  
+  kanban_tabela:: [[base_pagamentos]]  
+  kanban_query:: [[qry_pagamentos_validacao]]  
+  kanban_impacto:: alto  
+  kanban_tipo:: analise  
+  kanban_ambiente:: prod
+
+---
+
+# 14) Como usar no dia a dia
+
+Fluxo simples:
+
+1. Captura na daily em `Backlog`
+    
+2. Quando começar, muda `kanban_status:: doing`
+    
+3. Se travar, muda para `blocked` e preenche `kanban_motivo::`
+    
+4. Ao concluir, marca `[x]` e `kanban_status:: done`
+    
+
+Isso já te dá:
+
+- fila de trabalho
+    
+- visibilidade de bloqueios
+    
+- rastreio de pedidos
+    
+- mapa de impacto por tabela/query/macrotarefa
+    
+
+---
+
+# 15) Sugestão de notas complementares
+
+Além das dailies, vale criar notas para:
+
+- `retroacao_carteira.md`
+    
+- `base_pagamentos.md`
+    
+- `qry_pagamentos_validacao.md`
+    
+
+Assim você pode usar links como:
+
+kanban_macrotarefa:: [[retroacao_carteira]]  
+kanban_tabela:: [[base_pagamentos]]  
+kanban_query:: [[qry_pagamentos_validacao]]
+
+e transformar o Obsidian num mini catálogo de trabalho + dados.
