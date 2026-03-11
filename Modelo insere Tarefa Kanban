@@ -1,0 +1,30 @@
+- [ ] tarefa
+
+  [kanban_status::] <!-- backlog | doing | blocked | done -->
+  [kanban_prioridade::media] <!-- alta | media | baixa -->
+  [kanban_due::2026-03-11] <!-- prazo da tarefa -->
+  
+  [kanban_pedido::] <!-- ID do ticket ou demanda (ex: PED-4213) -->
+  [kanban_macrotarefa::] <!-- iniciativa maior (ex: [[retroacao_carteira]]) -->
+  [kanban_tabela::] <!-- tabela impactada (ex: [[base_contratos]]) -->
+  [kanban_query::] <!-- query relacionada -->
+
+  [kanban_impacto::medio] <!-- alto | medio | baixo -->
+
+  [kanban_motivo::] <!-- motivo do bloqueio -->
+  [kanban_dependencia::] <!-- pessoa / time / base dependente -->
+
+  [kanban_tempo_estimado::] <!-- estimativa (ex: 2h) -->
+  [kanban_tempo_gasto::] <!-- esforço real -->
+
+  [kanban_contexto::] <!-- resumo do problema ou análise -->
+
+  [kanban_tipo::] <!-- analise | bug | documentacao | alinhamento -->
+  [kanban_ambiente::] <!-- prod | dev | homolog -->
+
+  [kanban_mesref::] <!-- mês de referência (ex: 202602) -->
+  [kanban_escritorio::] <!-- escritório de cobrança -->
+  [kanban_contrato::] <!-- contrato específico -->
+
+  [kanban_origem::] <!-- daily | reunião | e-mail | gestor -->
+%%
