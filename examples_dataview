@@ -1,0 +1,359 @@
+Vou te mostrar **uma forma prática de começar**, pensando exatamente no seu contexto:
+
+* você trabalha com **Athena / SQL / pipelines**
+* tem **tarefas analíticas**
+* precisa **mapear tabelas, queries e dependências**
+* quer usar **Dataview** dentro do **Obsidian** para organizar isso.
+
+A ideia é montar **3 sistemas simples** que depois evoluem para um **catálogo de dados + task manager**.
+
+---
+
+# 🧭 Visão geral da estrutura
+
+Comece com algo simples:
+
+```
+analytics/
+│
+├─ tarefas/
+├─ tabelas/
+├─ queries/
+├─ pipelines/
+└─ dashboards/
+```
+
+Cada **objeto vira uma nota**.
+
+Isso permite que o Dataview funcione como **um mini banco de dados de documentação**.
+
+---
+
+# 1️⃣ Sistema de tarefas de analista
+
+Crie uma pasta:
+
+```
+tarefas/
+```
+
+Exemplo de nota:
+
+```
+tarefas/2026-03-10.md
+```
+
+```markdown
+# Tarefas do dia
+
+## Hoje
+
+- [ ] validar tabela de pagamentos #task
+- [ ] revisar query de retroação #task
+
+## Amanhã
+
+- [ ] documentar tabela contratos #task
+```
+
+Agora crie uma página:
+
+```
+tasks-dashboard.md
+```
+
+```dataview
+TASK
+FROM "tarefas"
+WHERE !completed
+SORT file.mtime DESC
+```
+
+Resultado:
+
+```
+☐ validar tabela de pagamentos
+☐ revisar query de retroação
+☐ documentar tabela contratos
+```
+
+Isso vira **seu backlog central**.
+
+---
+
+# 2️⃣ Catálogo de tabelas
+
+Crie:
+
+```
+tabelas/base_contratos.md
+```
+
+```markdown
+---
+tipo: tabela
+database: cobranca
+engine: athena
+schema: silver
+owner: analytics
+---
+
+# base_contratos
+
+## Colunas
+
+| coluna | tipo |
+|---|---|
+contrato | bigint
+cliente | bigint
+saldo | double
+```
+
+Agora crie:
+
+```
+catalogo_tabelas.md
+```
+
+```dataview
+TABLE database, schema, engine
+FROM "tabelas"
+WHERE tipo = "tabela"
+SORT file.name
+```
+
+Resultado:
+
+| tabela         | schema | engine |
+| -------------- | ------ | ------ |
+| base_contratos | silver | athena |
+
+Isso vira **um mini data catalog**.
+
+---
+
+# 3️⃣ Documentação de queries
+
+Crie:
+
+```
+queries/retroacao_atraso.md
+```
+
+````markdown
+---
+tipo: query
+fontes:
+ - base_contratos
+ - base_pagamentos
+---
+
+# Retroação de atraso
+
+## Query
+
+```sql
+select *
+from base_contratos
+join base_pagamentos
+````
+
+```
+
+Agora você pode mapear **linhagem de dados**.
+
+---
+
+# 4️⃣ Linhagem automática
+
+Crie:
+
+```
+
+linhagem_queries.md
+
+````
+
+```dataview
+TABLE fontes
+FROM "queries"
+WHERE tipo = "query"
+````
+
+Resultado:
+
+| query            | fontes                          |
+| ---------------- | ------------------------------- |
+| retroacao_atraso | base_contratos, base_pagamentos |
+
+---
+
+# 5️⃣ Impact analysis
+
+Na nota de uma tabela:
+
+```
+tabelas/base_contratos.md
+```
+
+adicione:
+
+```dataview
+LIST
+FROM "queries"
+WHERE contains(fontes, this.file.name)
+```
+
+Resultado:
+
+```
+retroacao_atraso
+carteira_ativos
+pipeline_comissao
+```
+
+Isso responde:
+
+**"quem usa essa tabela?"**
+
+---
+
+# 6️⃣ Dashboard de analytics
+
+Crie uma nota:
+
+```
+analytics_dashboard.md
+```
+
+````markdown
+# Analytics Dashboard
+
+## Tarefas abertas
+
+```dataview
+TASK
+FROM "tarefas"
+WHERE !completed
+````
+
+## Queries documentadas
+
+```dataview
+LIST
+FROM "queries"
+```
+
+## Tabelas
+
+```dataview
+TABLE database, schema
+FROM "tabelas"
+```
+
+```
+
+Isso vira **seu cockpit de analista**.
+
+---
+
+# 7️⃣ Evolução natural
+
+Depois que isso estiver funcionando você pode adicionar:
+
+### pipelines
+
+```
+
+pipelines/pipeline_comissao.md
+
+````
+
+```yaml
+---
+tipo: pipeline
+fontes:
+ - retroacao_atraso
+ - base_contratos
+---
+````
+
+---
+
+### dashboards
+
+```
+dashboards/quicksight_carteira.md
+```
+
+```yaml
+---
+tipo: dashboard
+fontes:
+ - view_carteira
+---
+```
+
+---
+
+# 🧠 O grafo final
+
+Seu vault começa a representar:
+
+```
+base_contratos
+     ↑
+retroacao_atraso
+     ↑
+pipeline_comissao
+     ↑
+dashboard_quicksight
+```
+
+Isso vira um **grafo de dados navegável**.
+
+---
+
+# ⚡ Comece pequeno (regra de ouro)
+
+Não tente documentar tudo.
+
+Comece com:
+
+1️⃣ tarefas
+2️⃣ tabelas críticas
+3️⃣ queries importantes
+
+Em **1 semana** você já terá algo útil.
+
+---
+
+# 💡 Uma coisa que ficaria **absurdamente útil para você**
+
+Como você trabalha com **Athena e queries salvas**, dá para fazer algo poderoso:
+
+extrair automaticamente:
+
+```
+tabelas usadas em cada query
+```
+
+e gerar **notas no Obsidian automaticamente**.
+
+Isso cria **linhagem de dados automática**.
+
+Se quiser, posso te mostrar também:
+
+**um workflow completo**
+
+```
+Athena query history
+     ↓
+SQL parser
+     ↓
+gera wikilinks
+     ↓
+Obsidian vira catálogo de dados
+```
+
+É uma das coisas mais poderosas que já vi analistas usarem no Obsidian.
