@@ -1,0 +1,757 @@
+Perfeito.
+Vou te entregar um **runbook avançado**, já no nível de plataforma de dados madura, para implementar um **Lakehouse Medallion no Athena** com:
+
+* **Bronze / Silver / Gold**
+* **Iceberg nas camadas refinadas**
+* **SCD2**
+* **reprocessamento seletivo de partições**
+* **otimização de small files / snapshots**
+* **estatísticas de colunas**
+* **materialized views nativas quando fizer sentido**
+* **fallback de “materialized view simulada” quando você quiser mais controle operacional**
+
+Ponto importante: no material mais recente da AWS, o **Glue Data Catalog já suporta materialized views Apache Iceberg**, criáveis com Athena, Glue 5.1+ e EMR 7.12+, com refresh automático gerenciado. Então hoje o caminho “simulado” continua útil, mas já não é mais a única saída. 
+
+---
+
+# Runbook avançado — Lakehouse Medallion no Athena
+
+## 1. Objetivo arquitetural
+
+Construir uma plataforma serverless em AWS com:
+
+```text
+Fontes
+  ↓
+Bronze (raw append-only)
+  ↓
+Silver (limpeza, padronização, deduplicação)
+  ↓
+Gold (modelo analítico / métricas / snapshots)
+  ↓
+Mart / MV / BI
+```
+
+No stack Athena, a base técnica fica em:
+
+* **S3** como storage.
+* **Glue Data Catalog** como camada de metadados.
+* **Athena** como engine SQL.
+* **Iceberg** para tabelas que exigem transacionalidade, `MERGE`, `UPDATE`, `DELETE`, time travel e evolução de schema. Athena suporta operações DML sobre Iceberg, e cada transação gera um novo snapshot.  
+* **Step Functions + EventBridge** para orquestração e agendamento; Athena também expõe eventos e métricas via CloudWatch/EventBridge para monitoramento e controle de custos. 
+
+---
+
+## 2. Decisão de modelagem por camada
+
+### Bronze
+
+Use **Parquet externo** ou Iceberg apenas se houver motivo forte.
+Objetivo da Bronze:
+
+* manter dado o mais próximo possível da origem
+* append-only
+* preservar histórico bruto
+* permitir replay
+
+### Silver
+
+Aqui começa a “contratualização” do dado:
+
+* tipagem correta
+* deduplicação
+* regras de qualidade
+* normalização de colunas
+* enriquecimento leve
+
+Pode ser Parquet ou Iceberg.
+Se houver atualização incremental com correções, merge ou necessidade de idempotência forte, eu recomendo **Iceberg já na Silver**.
+
+### Gold
+
+Deve ser preferencialmente **Iceberg** quando houver:
+
+* snapshots periódicos
+* tabelas de estado atual
+* SCD2
+* upsert
+* trilha histórica
+* time travel
+* manutenção evolutiva
+
+Athena engine v3 suporta `MERGE INTO` transacional apenas para tabelas Iceberg. 
+
+---
+
+## 3. Layout recomendado de S3
+
+```text
+s3://meu-lakehouse/
+  bronze/
+    cobranca/
+      pagamentos/
+      boletos/
+      contratos/
+  silver/
+    cobranca/
+      pagamentos/
+      contratos/
+      parcelas/
+  gold/
+    cobranca/
+      carteira_snapshot/
+      rollrate/
+      cliente_segmentacao_scd2/
+  mart/
+    cobranca/
+      dashboard_execucao/
+      dashboard_eficiencia/
+  ops/
+    athena-results/
+    manifests/
+    dq/
+```
+
+Regra prática:
+
+* **uma tabela = um prefixo raiz claro**
+* não misturar múltiplas tabelas no mesmo `location`
+* não reaproveitar pasta “suja” para recriar tabela com outro contrato lógico
+
+---
+
+## 4. Databases recomendados
+
+Crie databases por camada ou por domínio + camada.
+Para governança e clareza, eu prefiro:
+
+```sql
+CREATE DATABASE bronze LOCATION 's3://meu-lakehouse/bronze/';
+CREATE DATABASE silver LOCATION 's3://meu-lakehouse/silver/';
+CREATE DATABASE gold   LOCATION 's3://meu-lakehouse/gold/';
+CREATE DATABASE mart   LOCATION 's3://meu-lakehouse/mart/';
+```
+
+---
+
+## 5. Padrão de criação de tabelas Iceberg
+
+Athena suporta propriedades importantes em Iceberg, incluindo retenção de snapshots e thresholds de otimização, além de particionamento como `bucket(...)`. 
+
+Exemplo base:
+
+```sql
+CREATE TABLE gold.cliente_segmentacao_scd2 (
+    sk bigint,
+    cnpj_completo string,
+    des_segmentacao string,
+    dt_inicio_vigencia date,
+    dt_fim_vigencia date,
+    fl_ativo boolean,
+    anomesdia_origem_inicio int,
+    anomesdia_origem_fim int,
+    dt_carga timestamp
+)
+PARTITIONED BY (bucket(32, cnpj_completo))
+LOCATION 's3://meu-lakehouse/gold/cobranca/cliente_segmentacao_scd2/'
+TBLPROPERTIES (
+    'table_type'='ICEBERG',
+    'format'='parquet',
+    'write_compression'='snappy',
+    'vacuum_min_snapshots_to_keep'='3',
+    'vacuum_max_snapshot_age_seconds'='604800',
+    'vacuum_max_metadata_files_to_keep'='50',
+    'optimize_rewrite_delete_file_threshold'='10'
+);
+```
+
+### Como pensar nessas propriedades
+
+* `vacuum_min_snapshots_to_keep`: evita apagar histórico recente demais. 
+* `vacuum_max_snapshot_age_seconds`: controla idade máxima dos snapshots. 
+* `vacuum_max_metadata_files_to_keep`: evita acumular metadados demais. 
+* `optimize_rewrite_delete_file_threshold`: ajuda a decidir quando reescrever arquivos afetados por deletes. 
+
+---
+
+## 6. Particionamento: como escolher sem se sabotar
+
+Athena recomenda escolher partições alinhadas ao padrão de consulta, usar formatos colunares, evitar excesso de arquivos e evitar manutenção ruim de partições. 
+
+### Regra prática para seu contexto
+
+Para cobrança, normalmente:
+
+* Bronze: `anomesdia` ou `dt_referencia`
+* Silver: `anomes` ou `month(dt_evento)`
+* Gold snapshot: `dt_snapshot` ou `anomes`
+* Gold transacional/SCD2: muitas vezes **sem partição temporal**, ou com partição moderada, e bucket em chave de negócio
+
+### Heurística
+
+* **alta seletividade temporal** → partição por mês/dia
+* **muito ponto-a-ponto por chave** → `bucket(...)`
+* **cardinalidade muito alta** → não particionar diretamente por id puro
+
+Em Iceberg, o desenho correto da partição é ainda mais importante porque ela impacta manutenção, pruning e tamanho de arquivos. O material da Glue reforça o trade-off entre granularidade de partição e overhead de metadados. 
+
+---
+
+## 7. Bronze: ingestão robusta
+
+### Objetivo
+
+Receber dados de origem e gravar em Parquet cru.
+
+Exemplo:
+
+```sql
+CREATE EXTERNAL TABLE bronze.pagamentos_raw (
+    contrato_id string,
+    valor string,
+    data_pagamento string,
+    origem_arquivo string,
+    dt_ingestao timestamp,
+    anomesdia int
+)
+STORED AS PARQUET
+LOCATION 's3://meu-lakehouse/bronze/cobranca/pagamentos/';
+```
+
+### Regras operacionais
+
+* manter colunas técnicas: `dt_ingestao`, `origem_arquivo`, `run_id`
+* não sobrescrever Bronze
+* permitir replay de uma janela inteira
+
+---
+
+## 8. Silver: limpeza + deduplicação + contrato lógico
+
+Se a Silver for tabela Parquet externa simples:
+
+```sql
+CREATE TABLE silver.pagamentos
+WITH (
+    format='PARQUET',
+    external_location='s3://meu-lakehouse/silver/cobranca/pagamentos/'
+)
+AS
+SELECT
+    contrato_id,
+    CAST(valor AS double) AS valor,
+    CAST(data_pagamento AS date) AS data_pagamento,
+    anomesdia,
+    dt_ingestao
+FROM bronze.pagamentos_raw
+WHERE try_cast(valor AS double) IS NOT NULL;
+```
+
+Se a Silver precisar de idempotência / upsert, use Iceberg:
+
+```sql
+CREATE TABLE silver.pagamentos (
+    contrato_id string,
+    valor double,
+    data_pagamento date,
+    anomesdia int,
+    dt_ingestao timestamp
+)
+PARTITIONED BY (anomesdia)
+LOCATION 's3://meu-lakehouse/silver/cobranca/pagamentos/'
+TBLPROPERTIES (
+    'table_type'='ICEBERG',
+    'format'='parquet'
+);
+```
+
+---
+
+## 9. Padrão de incremental idempotente
+
+O grande salto de maturidade é sair de “reprocessa tudo” para “reprocessa só o necessário”.
+
+### Tabela de controle sugerida
+
+```sql
+CREATE TABLE gold.ctrl_execucao_pipeline (
+    pipeline_nm string,
+    etapa_nm string,
+    run_id string,
+    dt_execucao timestamp,
+    valor_controle string,
+    status string
+)
+WITH (
+    table_type='ICEBERG',
+    format='PARQUET',
+    location='s3://meu-lakehouse/gold/ops/ctrl_execucao_pipeline/'
+);
+```
+
+### Estratégia
+
+Para cada etapa, grave:
+
+* último `anomesdia` processado
+* último snapshot id consumido, se fizer sentido
+* hash/contagem por partição
+* status do run
+
+---
+
+## 10. Reprocessamento seletivo de partições
+
+Esse é um ponto que muda o jogo.
+
+### Estratégia prática
+
+1. Detecte partições candidatas a reprocessamento.
+2. Grave lista em tabela de controle.
+3. Faça loop pela lista.
+4. Regrave apenas o escopo afetado.
+
+### Tabela de controle de partições
+
+```sql
+CREATE TABLE gold.ctrl_particoes_reprocessar (
+    pipeline_nm string,
+    tabela_nm string,
+    valor_particao string,
+    motivo string,
+    dt_detectado timestamp,
+    fl_processado boolean
+)
+WITH (
+    table_type='ICEBERG',
+    format='PARQUET',
+    location='s3://meu-lakehouse/gold/ops/ctrl_particoes_reprocessar/'
+);
+```
+
+### Critérios comuns
+
+* nova partição apareceu
+* contagem mudou
+* tamanho total de arquivos mudou
+* modified time mudou
+* regra de qualidade falhou
+* houve correção retroativa de origem
+
+### Orquestração
+
+* EventBridge agenda
+* Step Functions inicia
+* Athena detecta partições alteradas
+* Step Functions faz `Map` sobre partições
+* cada iteração executa SQL/Glue para a partição
+
+Isso é melhor do que rebuild total porque reduz custo e janela de processamento.
+
+---
+
+## 11. SCD2 em Iceberg no Athena
+
+Kimball trata SCD2 como “adicionar nova linha e fechar a antiga”, em vez de sobrescrever histórico. Isso continua extremamente válido para Lakehouse. 
+
+### Estrutura sugerida
+
+```sql
+CREATE TABLE gold.cliente_segmentacao_scd2 (
+    sk bigint,
+    cnpj_completo string,
+    des_segmentacao string,
+    dt_inicio_vigencia date,
+    dt_fim_vigencia date,
+    fl_ativo boolean,
+    anomesdia_origem_inicio int,
+    anomesdia_origem_fim int,
+    dt_carga timestamp
+)
+WITH (
+    table_type='ICEBERG',
+    format='PARQUET',
+    location='s3://meu-lakehouse/gold/cobranca/cliente_segmentacao_scd2/'
+);
+```
+
+### Fluxo SCD2
+
+1. materializa `src_hoje`
+2. identifica chaves novas
+3. identifica chaves alteradas
+4. fecha linha ativa anterior
+5. insere nova versão
+
+### Exemplo de fechamento da linha antiga
+
+```sql
+UPDATE gold.cliente_segmentacao_scd2 t
+SET
+    dt_fim_vigencia = date_add('day', -1, s.dt_inicio_nova),
+    fl_ativo = false,
+    anomesdia_origem_fim = s.anomesdia
+FROM (
+    SELECT
+        cnpj_completo,
+        CAST(date_parse(CAST(anomesdia AS varchar), '%Y%m%d') AS date) AS dt_inicio_nova,
+        anomesdia
+    FROM silver.cliente_segmentacao_src
+) s
+WHERE t.cnpj_completo = s.cnpj_completo
+  AND t.fl_ativo = true
+  AND COALESCE(t.des_segmentacao, '') <> COALESCE(s.des_segmentacao, '');
+```
+
+### Inserção das novas linhas
+
+```sql
+INSERT INTO gold.cliente_segmentacao_scd2
+SELECT
+    row_number() OVER () + 1000000 AS sk,
+    s.cnpj_completo,
+    s.des_segmentacao,
+    CAST(date_parse(CAST(s.anomesdia AS varchar), '%Y%m%d') AS date) AS dt_inicio_vigencia,
+    DATE '9999-12-31' AS dt_fim_vigencia,
+    true AS fl_ativo,
+    s.anomesdia AS anomesdia_origem_inicio,
+    NULL AS anomesdia_origem_fim,
+    current_timestamp AS dt_carga
+FROM silver.cliente_segmentacao_src s
+LEFT JOIN gold.cliente_segmentacao_scd2 t
+  ON t.cnpj_completo = s.cnpj_completo
+ AND t.fl_ativo = true
+WHERE t.cnpj_completo IS NULL
+   OR COALESCE(t.des_segmentacao, '') <> COALESCE(s.des_segmentacao, '');
+```
+
+### Observação importante
+
+Athena suporta `UPDATE`, `DELETE` e `MERGE INTO` em Iceberg, com snapshot isolation e geração de snapshots novos a cada transação.  
+
+---
+
+## 12. Gold de snapshots periódicos
+
+Para carteira, roll-rate e visão executiva, o padrão mais forte normalmente é **periodic snapshot**, muito alinhado com Kimball. 
+
+Exemplo:
+
+```sql
+CREATE TABLE gold.carteira_snapshot (
+    dt_snapshot date,
+    contrato_id string,
+    saldo_aberto double,
+    faixa_atraso string,
+    escritorio string,
+    status_cobranca string
+)
+WITH (
+    table_type='ICEBERG',
+    format='PARQUET',
+    location='s3://meu-lakehouse/gold/cobranca/carteira_snapshot/'
+);
+```
+
+Carga diária:
+
+```sql
+INSERT INTO gold.carteira_snapshot
+SELECT
+    current_date AS dt_snapshot,
+    contrato_id,
+    saldo_aberto,
+    faixa_atraso,
+    escritorio,
+    status_cobranca
+FROM silver.carteira_posicional;
+```
+
+---
+
+## 13. Time travel e auditoria
+
+Athena suporta:
+
+* `FOR TIMESTAMP AS OF`
+* `FOR VERSION AS OF`
+
+para consultar snapshots anteriores de uma tabela Iceberg.  
+
+### Exemplo
+
+```sql
+SELECT *
+FROM gold.carteira_snapshot
+FOR TIMESTAMP AS OF (current_timestamp - interval '1' day);
+```
+
+### Onde isso ajuda muito
+
+* auditoria de divergência
+* comparação antes/depois de refresh
+* rollback lógico de investigação
+* validação de pipeline
+
+---
+
+## 14. Otimização: small files, compaction e snapshots
+
+A Glue Data Catalog oferece **compaction gerenciada** para tabelas Iceberg, além de retenção de snapshots e deleção de órfãos como recursos de otimização de tabela.  
+
+### Estratégia prática
+
+* Silver muito incremental → tende a criar small files
+* Gold com muitos `MERGE`/`UPDATE` → tende a acumular delete files
+* ative otimizações periódicas de Iceberg
+* ajuste retenção de snapshots conforme SLA de auditoria
+
+### Regra operacional
+
+* tabela crítica e muito acessada → otimização diária
+* tabela média → semanal
+* tabela fria → sob demanda
+
+---
+
+## 15. Estatísticas de coluna
+
+A Glue consegue gerar estatísticas de coluna para Iceberg, inclusive NDV, e armazená-las no catálogo. Isso melhora otimização de queries. Pode ser sob demanda, agendado ou até automático no nível do catálogo.   
+
+### O que eu recomendo
+
+Habilitar estatísticas automáticas no catálogo, se governança permitir:
+
+* melhora custo do otimizador
+* ajuda joins e filtros
+* reduz tuning manual
+
+O próprio Glue permite configurar `ColumnStatistics.Enabled` e `ColumnStatistics.RoleArn` no catálogo. 
+
+---
+
+## 16. Materialized views: nativa vs simulada
+
+### Opção A — materialized view nativa
+
+Hoje o Glue Data Catalog suporta **Apache Iceberg materialized views**, com refresh automático e gerenciamento do ciclo de vida. Elas podem ser criadas via Athena, Glue 5.1+ e EMR.  
+
+Use quando:
+
+* a query é cara e muito repetida
+* o refresh automático faz sentido
+* você quer simplificar transformação e serving
+
+### Opção B — “MV simulada”
+
+Crie uma tabela Iceberg/Parquet de saída e alimente por Step Functions + Athena SQL.
+
+Use quando:
+
+* você quer refresh em horário específico
+* quer dependência explícita entre etapas
+* quer fallback controlado
+* quer lógica incremental customizada
+
+### Heurística honesta
+
+* **dashboard executivo simples e repetitivo** → MV nativa
+* **regra de negócio forte / incremental custom** → MV simulada
+
+---
+
+## 17. Marts de consumo
+
+A camada `mart` deve ser fina, orientada a consumo.
+
+Exemplo:
+
+```sql
+CREATE TABLE mart.dashboard_execucao
+WITH (
+    table_type='ICEBERG',
+    format='PARQUET',
+    location='s3://meu-lakehouse/mart/cobranca/dashboard_execucao/'
+)
+AS
+SELECT
+    dt_snapshot,
+    escritorio,
+    faixa_atraso,
+    COUNT(*) AS qtd_contratos,
+    SUM(saldo_aberto) AS saldo_aberto
+FROM gold.carteira_snapshot
+GROUP BY 1,2,3;
+```
+
+Regra:
+
+* QuickSight lê **mart** ou **gold já resumida**
+* nunca a Bronze
+* evite deixar BI reconstruindo lógica pesada
+
+---
+
+## 18. Orquestração de ponta a ponta
+
+### Fluxo sugerido
+
+```text
+EventBridge
+  ↓
+Step Functions
+  ↓
+1 Detecta escopo incremental
+  ↓
+2 Ingest Bronze
+  ↓
+3 Atualiza Silver
+  ↓
+4 Reprocessa partições afetadas
+  ↓
+5 Atualiza SCD2 / snapshots Gold
+  ↓
+6 Atualiza Mart / MV
+  ↓
+7 Dispara otimização / estatísticas
+  ↓
+8 Validação final e métricas
+```
+
+### Estados recomendados
+
+* `DetectScope`
+* `RunBronzeLoad`
+* `RunSilverSql`
+* `MapPartitionsToReprocess`
+* `RunGoldScd2`
+* `RunGoldSnapshot`
+* `RefreshMart`
+* `RunIcebergOptimization`
+* `RunColumnStatistics`
+* `ValidateAndPublish`
+
+---
+
+## 19. Validação e data quality
+
+Antes de publicar mart:
+
+* contagem mínima esperada
+* ausência de duplicidade em chave natural
+* nulidade em colunas obrigatórias
+* conciliação de saldo/quantidade
+* comparação vs snapshot anterior
+
+Exemplo:
+
+```sql
+SELECT contrato_id, COUNT(*)
+FROM gold.cliente_segmentacao_scd2
+WHERE fl_ativo = true
+GROUP BY 1
+HAVING COUNT(*) > 1;
+```
+
+Se retornar linha, falhou.
+
+---
+
+## 20. Observabilidade
+
+Athena expõe métricas em CloudWatch e eventos em EventBridge, úteis para monitorar query state change, custo e operação. 
+Glue também integra com EventBridge para automação operacional. 
+
+### Monitore
+
+* duração por etapa
+* dados varridos por query
+* falhas por estado
+* quantidade de partições reprocessadas
+* atraso do pipeline
+* contagem produzida vs esperada
+
+---
+
+## 21. Anti-patterns que você deve evitar
+
+### 1. Bronze com regra de negócio
+
+Erro clássico.
+Bronze é replay e rastreabilidade, não camada de semântica.
+
+### 2. Gold sem Iceberg quando precisa merge
+
+Você perde transacionalidade e vira refém de rebuilds caros.
+
+### 3. Particionar por coluna errada
+
+Partição ruim piora custo e manutenção. Athena enfatiza alinhar partição ao padrão real de query. 
+
+### 4. QuickSight em cima de Silver pesada
+
+Isso transfere custo para refresh e degrada experiência.
+
+### 5. Não controlar snapshots / compaction
+
+Tabela funciona no começo e degrada depois.
+
+### 6. Não guardar tabela de controle
+
+Sem controle de execução, incremental vira adivinhação.
+
+---
+
+## 22. Blueprint mínimo recomendado para você
+
+Se eu estivesse desenhando isso para seu contexto de cobrança no Athena, eu faria assim:
+
+### Bronze
+
+* `bronze.pagamentos_raw`
+* `bronze.boletos_raw`
+* `bronze.contratos_raw`
+
+### Silver
+
+* `silver.pagamentos`
+* `silver.boletos`
+* `silver.contratos`
+* `silver.carteira_posicional`
+
+### Gold
+
+* `gold.cliente_segmentacao_scd2`
+* `gold.carteira_snapshot`
+* `gold.rollrate_mensal`
+* `gold.eficiencia_cobranca`
+
+### Mart
+
+* `mart.dashboard_execucao`
+* `mart.dashboard_rollrate`
+* `mart.dashboard_eficiencia`
+
+### Operações
+
+* `gold.ctrl_execucao_pipeline`
+* `gold.ctrl_particoes_reprocessar`
+
+---
+
+## 23. Recomendação final de arquitetura
+
+Para seu stack, o desenho mais sólido hoje é:
+
+* **Bronze em Parquet externo**
+* **Silver em Iceberg quando houver incremental relevante**
+* **Gold quase toda em Iceberg**
+* **Mart em Iceberg ou MV nativa**
+* **Step Functions como maestro**
+* **Glue Catalog com estatísticas e otimizações habilitadas**
+* **EventBridge para agendamento**
+* **QuickSight lendo mart/gold pronta**
+
+Isso casa muito bem com o que a documentação atual do Athena e da Glue já suportam para Iceberg: DML transacional, time travel, propriedades de vacuum/otimização, estatísticas e materialized views gerenciadas.   
+
+Se quiser, no próximo passo eu monto isso em formato de **nota Obsidian + checklist operacional + SQL base das tabelas de controle + esqueleto da Step Function**.
