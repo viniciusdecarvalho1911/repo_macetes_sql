@@ -1,0 +1,615 @@
+A seguir está uma **nota pronta para colar no Obsidian** com **templates reutilizáveis de diagramas de engenharia de dados para Draw.io**.
+A ideia é que você tenha um **catálogo mental + visual** para desenhar rapidamente arquiteturas, pipelines e modelos — algo muito útil no seu contexto com **Athena + Glue + Lakehouse + QuickSight**.
+
+---
+
+# 🧩 Templates de Diagramas de Engenharia de Dados (Draw.io)
+
+> Biblioteca prática de **templates de arquitetura, pipelines e modelagem de dados** para usar no Draw.io (diagrams.net).
+
+---
+
+# 🎯 Objetivo
+
+Ter **modelos mentais padronizados** para desenhar rapidamente:
+
+* arquiteturas de dados
+* pipelines ETL
+* modelagem dimensional
+* fluxos analíticos
+* arquiteturas lakehouse
+
+Isso acelera:
+
+* documentação
+* comunicação com times
+* design de sistemas
+* onboarding
+
+---
+
+# 🧱 1 — Arquitetura Lakehouse
+
+Esse é o **diagrama mais importante de uma plataforma de dados moderna**.
+
+---
+
+## Template
+
+```text
+┌────────────────────────────┐
+│         FONTES             │
+│ CRM / ERP / APIs / Logs    │
+└──────────────┬─────────────┘
+               │
+               ▼
+┌────────────────────────────┐
+│        INGESTÃO            │
+│ Kafka / Glue / Fivetran    │
+└──────────────┬─────────────┘
+               │
+               ▼
+┌────────────────────────────┐
+│         BRONZE             │
+│ Dados crus                 │
+│ S3 / Data Lake             │
+└──────────────┬─────────────┘
+               │
+               ▼
+┌────────────────────────────┐
+│         SILVER             │
+│ Dados limpos               │
+│ Transformações             │
+└──────────────┬─────────────┘
+               │
+               ▼
+┌────────────────────────────┐
+│          GOLD              │
+│ Métricas / Data Marts      │
+└──────────────┬─────────────┘
+               │
+               ▼
+┌────────────────────────────┐
+│         CONSUMO            │
+│ BI / APIs / ML             │
+└────────────────────────────┘
+```
+
+---
+
+## Uso
+
+Documentar:
+
+* arquitetura lakehouse
+* plataforma de dados
+* modern data stack
+
+---
+
+# 🧱 2 — Pipeline Batch
+
+Muito usado em pipelines ETL.
+
+---
+
+## Template
+
+```text
+Fonte de Dados
+      │
+      ▼
+Ingestão
+      │
+      ▼
+Raw Table
+      │
+      ▼
+Transformação
+      │
+      ▼
+Tabela Refinada
+      │
+      ▼
+Data Mart
+      │
+      ▼
+Dashboard
+```
+
+---
+
+## Exemplo real (Athena)
+
+```text
+Boletos
+Pagamentos
+CRM
+
+     │
+     ▼
+Glue Job
+
+     │
+     ▼
+S3 Bronze
+
+     │
+     ▼
+Athena Transform
+
+     │
+     ▼
+S3 Silver
+
+     │
+     ▼
+Iceberg Gold
+
+     │
+     ▼
+QuickSight
+```
+
+---
+
+# 🧱 3 — Pipeline Orquestrado
+
+Mostra **automação e controle de execução**.
+
+---
+
+## Template
+
+```text
+Scheduler
+(EventBridge / Airflow)
+        │
+        ▼
+Orquestrador
+(Step Functions)
+        │
+        ▼
+ETL Job
+        │
+        ▼
+Transformação
+        │
+        ▼
+Tabela final
+```
+
+---
+
+## Exemplo AWS
+
+```text
+EventBridge
+      │
+      ▼
+Step Function
+      │
+      ▼
+Glue Job
+      │
+      ▼
+Athena CTAS
+      │
+      ▼
+Tabela Gold
+```
+
+---
+
+# 🧱 4 — Pipeline Incremental
+
+Muito importante para **performance em data lake**.
+
+---
+
+## Template
+
+```text
+Tabela Origem
+       │
+       ▼
+Filtro Incremental
+(last_update)
+       │
+       ▼
+Transformação
+       │
+       ▼
+Merge / Upsert
+       │
+       ▼
+Tabela Destino
+```
+
+---
+
+## Exemplo com Iceberg
+
+```text
+Tabela Fonte
+       │
+       ▼
+Filtro
+(anomesdia > max_processado)
+       │
+       ▼
+Transformação
+       │
+       ▼
+MERGE INTO
+Tabela Iceberg
+```
+
+---
+
+# 🧱 5 — Pipeline CDC
+
+Muito usado em arquiteturas modernas.
+
+---
+
+## Template
+
+```text
+Banco OLTP
+      │
+      ▼
+CDC Capture
+      │
+      ▼
+Stream
+(Kafka / Kinesis)
+      │
+      ▼
+Processamento
+      │
+      ▼
+Data Lake
+```
+
+---
+
+# 🧱 6 — Star Schema
+
+Modelo clássico de **data warehouse**.
+
+Baseado na modelagem de **Ralph Kimball**.
+
+---
+
+## Template
+
+```text
+            dim_cliente
+                │
+                │
+dim_data ─ fact_vendas ─ dim_produto
+                │
+                │
+         dim_escritorio
+```
+
+---
+
+## Elementos
+
+Fact table:
+
+```text
+fact_pagamentos
+```
+
+Dimensões:
+
+```text
+dim_cliente
+dim_data
+dim_produto
+dim_escritorio
+```
+
+---
+
+# 🧱 7 — Modelo ER
+
+Muito usado em bancos operacionais.
+
+---
+
+## Template
+
+```text
+Cliente
+   │
+   │ 1:N
+   │
+Pedido
+   │
+   │ 1:N
+   │
+ItemPedido
+```
+
+---
+
+# 🧱 8 — Data Mart
+
+Mostra como dados analíticos são organizados.
+
+---
+
+## Template
+
+```text
+Data Lake Silver
+        │
+        ▼
+Transformação
+        │
+        ▼
+Fact Table
+        │
+        ├── Dim Cliente
+        ├── Dim Produto
+        └── Dim Data
+```
+
+---
+
+# 🧱 9 — Fluxo Analítico
+
+Muito usado por consultorias.
+
+---
+
+## Template
+
+```text
+Base de Clientes
+       │
+       ▼
+Segmentação
+       │
+       ▼
+Campanha
+       │
+       ▼
+Conversão
+       │
+       ▼
+Resultado
+```
+
+---
+
+# 🧱 10 — Arquitetura de Analytics
+
+Muito comum em empresas modernas.
+
+---
+
+## Template
+
+```text
+Fontes
+ │
+ ▼
+Ingestão
+ │
+ ▼
+Data Lake
+ │
+ ▼
+Transformações
+ │
+ ▼
+Data Warehouse
+ │
+ ▼
+BI / ML
+```
+
+---
+
+# 🧠 Convenções visuais recomendadas
+
+Padronizar cores melhora muito a leitura.
+
+---
+
+## Sugestão
+
+```text
+Azul → fontes
+Cinza → raw
+Amarelo → transformação
+Verde → gold
+Roxo → consumo
+```
+
+---
+
+# 🧠 Organização por domínio
+
+Separar dados por domínio melhora arquitetura.
+
+---
+
+## Exemplo
+
+```text
+Domínio Cobrança
+Domínio Jurídico
+Domínio Financeiro
+Domínio Clientes
+```
+
+---
+
+# 🧠 Camadas no Draw.io
+
+Use **layers**.
+
+---
+
+## Estrutura
+
+```text
+Layer 1 → infraestrutura
+Layer 2 → dados
+Layer 3 → processos
+Layer 4 → governança
+```
+
+---
+
+# 🧠 Convenções de nomenclatura
+
+Evite nomes genéricos.
+
+---
+
+## Ruim
+
+```text
+tabela_final
+dados_ok
+base1
+```
+
+---
+
+## Bom
+
+```text
+stg_contratos
+silver_pagamentos
+fact_pagamentos
+dim_cliente
+gold_rollrate
+```
+
+---
+
+# 🧠 Estrutura padrão de um Data Lake
+
+```text
+lakehouse/
+    
+    bronze/
+        cobranca/
+        pagamentos/
+        boletos/
+    
+    silver/
+        contratos/
+        parcelas/
+    
+    gold/
+        carteira_snapshot/
+        rollrate/
+    
+    mart/
+        dashboards/
+```
+
+---
+
+# 🧠 Exercício recomendado
+
+Pegue **um pipeline real** e desenhe três diagramas.
+
+---
+
+## Arquitetura
+
+```text
+fontes → ingestão → bronze → silver → gold
+```
+
+---
+
+## Pipeline
+
+```text
+scheduler → job → transformação → tabela
+```
+
+---
+
+## Modelagem
+
+```text
+fact
++
+dimensões
+```
+
+---
+
+# 🚀 Regras para diagramas profissionais
+
+Um bom diagrama deve ter:
+
+```text
+1 pergunta clara
++
+1 nível de abstração
++
+fluxo legível
++
+nomenclatura correta
++
+padronização visual
+```
+
+---
+
+# 📌 Checklist de qualidade
+
+Antes de finalizar um diagrama, verifique:
+
+* [ ] o fluxo está claro?
+* [ ] as camadas estão separadas?
+* [ ] os nomes são semânticos?
+* [ ] não há mistura de níveis?
+* [ ] qualquer pessoa consegue entender em 30 segundos?
+
+---
+
+# 🧠 Regra final
+
+Se alguém olhar seu diagrama e perguntar:
+
+> "O que isso quer dizer?"
+
+Então o diagrama falhou.
+
+---
+
+## 📚 Referências
+
+Livros fundamentais para modelagem e arquitetura de dados:
+
+* *Fundamentals of Data Engineering*
+* *The Data Warehouse Toolkit*
+* *Star Schema: The Complete Reference*
+
+---
+
+Se quiser, posso também te gerar uma terceira nota **extremamente poderosa** para Obsidian:
+
+### **“Biblioteca de ícones e shapes ideais para diagramas de dados no Draw.io”**
+
+com:
+
+* layout de **arquitetura AWS**
+* ícones ideais para **data pipelines**
+* padrão visual usado por **Databricks / Snowflake / AWS SA**
+
+Isso **eleva absurdamente o nível dos diagramas** que engenheiros de dados produzem.
