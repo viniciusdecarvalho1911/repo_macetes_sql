@@ -1,0 +1,486 @@
+Vou montar um **runbook realista de engenharia de dados**, pensando exatamente no seu stack:
+
+* **S3**
+* **Athena**
+* **Glue Catalog**
+* **Iceberg**
+* **Step Functions**
+* **EventBridge**
+
+Isso é praticamente o **padrão de Lakehouse serverless na AWS**.
+
+A arquitetura segue o padrão **Medallion (Bronze → Silver → Gold)**, muito usado em plataformas Lakehouse.
+
+---
+
+# 📘 Runbook — Implementando Lakehouse Medallion no Athena
+
+## Contexto
+
+Implementar um **Lakehouse no Amazon Athena** usando:
+
+* S3 como storage
+* Glue como catálogo
+* Iceberg como table format
+* Athena como compute
+* Step Functions para orquestração
+
+Estrutura:
+
+```
+Fontes
+   ↓
+Bronze
+   ↓
+Silver
+   ↓
+Gold
+   ↓
+Consumo
+```
+
+---
+
+# 🧱 Arquitetura alvo
+
+```
+Fontes
+  │
+  ▼
+Ingestão (Glue / Lambda / Batch)
+  │
+  ▼
+S3 Bronze
+  │
+  ▼
+Athena Transform
+  │
+  ▼
+S3 Silver
+  │
+  ▼
+Athena MERGE
+  │
+  ▼
+Iceberg Gold
+  │
+  ▼
+QuickSight / APIs
+```
+
+---
+
+# 🧱 Estrutura do Data Lake
+
+Criar a estrutura no S3.
+
+```
+s3://lakehouse/
+
+    bronze/
+        cobranca/
+            boletos/
+            pagamentos/
+
+    silver/
+        cobranca/
+            contratos/
+            parcelas/
+
+    gold/
+        cobranca/
+            carteira_snapshot/
+            rollrate/
+
+    mart/
+        cobranca/
+            dashboards/
+```
+
+---
+
+# 🧱 Passo 1 — Criar o Database
+
+No Athena:
+
+```sql
+CREATE DATABASE lakehouse
+LOCATION 's3://lakehouse/';
+```
+
+---
+
+# 🧱 Passo 2 — Criar tabela Bronze
+
+Bronze normalmente:
+
+* Parquet
+* append-only
+* sem muitas regras
+
+Exemplo:
+
+```sql
+CREATE EXTERNAL TABLE lakehouse.bronze_pagamentos (
+    contrato_id string,
+    valor double,
+    data_pagamento date,
+    anomesdia int
+)
+STORED AS PARQUET
+LOCATION 's3://lakehouse/bronze/cobranca/pagamentos/';
+```
+
+---
+
+# 🧱 Passo 3 — Ingestão Bronze
+
+Carga pode vir de:
+
+```
+Glue Job
+Lambda
+Batch
+Kinesis
+```
+
+Exemplo Glue:
+
+```
+fonte → parquet → bronze
+```
+
+Bronze deve manter:
+
+* histórico completo
+* schema próximo ao original
+
+---
+
+# 🧱 Passo 4 — Criar tabela Silver
+
+Silver já possui:
+
+* limpeza
+* deduplicação
+* tipagem correta
+
+Exemplo usando **CTAS**.
+
+```sql
+CREATE TABLE lakehouse.silver_pagamentos
+WITH (
+    format='PARQUET',
+    external_location='s3://lakehouse/silver/cobranca/pagamentos/'
+)
+AS
+SELECT
+    contrato_id,
+    valor,
+    data_pagamento,
+    anomesdia
+FROM lakehouse.bronze_pagamentos
+WHERE valor > 0;
+```
+
+---
+
+# 🧱 Passo 5 — Incremental Silver
+
+Evitar reprocessar tudo.
+
+Exemplo:
+
+```sql
+INSERT INTO lakehouse.silver_pagamentos
+SELECT *
+FROM lakehouse.bronze_pagamentos
+WHERE anomesdia >= 20240101;
+```
+
+Melhor ainda usar **max(anomesdia)**.
+
+---
+
+# 🧱 Passo 6 — Criar tabela Gold (Iceberg)
+
+Gold deve ser **Iceberg**.
+
+Isso permite:
+
+* MERGE
+* UPDATE
+* DELETE
+* versionamento
+
+Exemplo:
+
+```sql
+CREATE TABLE lakehouse.gold_carteira
+(
+    contrato_id string,
+    saldo double,
+    data_snapshot date
+)
+WITH (
+    table_type='ICEBERG',
+    format='PARQUET',
+    location='s3://lakehouse/gold/cobranca/carteira_snapshot/'
+);
+```
+
+---
+
+# 🧱 Passo 7 — Popular Gold
+
+Exemplo agregação.
+
+```sql
+INSERT INTO lakehouse.gold_carteira
+SELECT
+    contrato_id,
+    SUM(valor) saldo,
+    current_date data_snapshot
+FROM lakehouse.silver_pagamentos
+GROUP BY contrato_id;
+```
+
+---
+
+# 🧱 Passo 8 — Atualização incremental Gold
+
+Iceberg permite **MERGE**.
+
+Exemplo:
+
+```sql
+MERGE INTO lakehouse.gold_carteira t
+USING (
+    SELECT
+        contrato_id,
+        SUM(valor) saldo
+    FROM lakehouse.silver_pagamentos
+    GROUP BY contrato_id
+) s
+ON t.contrato_id = s.contrato_id
+
+WHEN MATCHED THEN
+UPDATE SET saldo = s.saldo
+
+WHEN NOT MATCHED THEN
+INSERT (contrato_id, saldo)
+VALUES (s.contrato_id, s.saldo);
+```
+
+---
+
+# 🧱 Passo 9 — Orquestração
+
+Arquitetura típica:
+
+```
+EventBridge
+    ↓
+Step Functions
+    ↓
+Athena Query
+    ↓
+Glue Job
+```
+
+---
+
+## Step Functions Flow
+
+```
+Start
+ ↓
+Ingest Bronze
+ ↓
+Process Silver
+ ↓
+Update Gold
+ ↓
+Refresh Mart
+ ↓
+End
+```
+
+---
+
+# 🧱 Passo 10 — Atualizar Data Mart
+
+Gold alimenta marts.
+
+Exemplo:
+
+```sql
+CREATE TABLE lakehouse.mart_carteira
+WITH (
+    format='PARQUET',
+    external_location='s3://lakehouse/mart/cobranca/dashboard/'
+)
+AS
+SELECT
+    data_snapshot,
+    SUM(saldo) saldo_total
+FROM lakehouse.gold_carteira
+GROUP BY data_snapshot;
+```
+
+---
+
+# 🧱 Passo 11 — Conectar QuickSight
+
+Dataset:
+
+```
+Athena
+ ↓
+mart_carteira
+```
+
+Sempre consumir **mart ou gold**.
+
+Nunca Bronze.
+
+---
+
+# 🧠 Boas práticas importantes
+
+---
+
+## 1️⃣ Bronze nunca transforma
+
+Bronze deve ser:
+
+```
+append only
+raw
+histórico completo
+```
+
+---
+
+## 2️⃣ Silver limpa dados
+
+Exemplos:
+
+```
+deduplicação
+tipagem
+enriquecimento
+joins
+```
+
+---
+
+## 3️⃣ Gold modela métricas
+
+Exemplos:
+
+```
+rollrate
+snapshot carteira
+eficiência
+cohort
+```
+
+---
+
+## 4️⃣ Particionamento
+
+Muito importante no Athena.
+
+Exemplo:
+
+```
+anomes
+anomesdia
+data
+```
+
+---
+
+## 5️⃣ Tamanho de arquivos
+
+Ideal:
+
+```
+128MB – 512MB
+```
+
+---
+
+# 🧠 Governança
+
+Usar:
+
+```
+Glue Catalog
+Lake Formation
+```
+
+Para:
+
+```
+acesso
+metadata
+linhagem
+```
+
+---
+
+# 🧠 Estrutura ideal final
+
+```
+lakehouse/
+
+bronze/
+silver/
+gold/
+mart/
+
+catalog/
+orchestration/
+monitoring/
+```
+
+---
+
+# 🚀 Arquitetura madura
+
+```
+S3
++
+Iceberg
++
+Glue Catalog
++
+Athena
++
+Step Functions
++
+EventBridge
+```
+
+Isso forma um **Lakehouse serverless completo**.
+
+---
+
+# 🚀 Se quiser, posso te mostrar algo ainda mais poderoso
+
+Posso montar também:
+
+### **Runbook avançado**
+
+com:
+
+* SCD2 no Iceberg
+* reprocessamento automático de partições
+* detecção de alteração de dados
+* metadata-driven pipelines
+* materialized views simuladas
+* otimização de custo no Athena
+
+Esse é basicamente **o blueprint usado em plataformas de dados maduras**.
