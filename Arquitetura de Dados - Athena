@@ -1,0 +1,651 @@
+Vou estruturar a nota **pensando em como você realmente usa o Obsidian**:
+
+* bem **hierárquica**
+* com **blocos reutilizáveis**
+* com **checklists de prática**
+* com **templates de diagramas**
+* com **padrões que você pode aplicar nos pipelines Athena / Glue / Lakehouse** que você já vem construindo.
+
+---
+
+# 🧠 Modelagem de Dados com Draw.io (diagrams.net)
+
+> Guia prático para usar **Draw.io como ferramenta de raciocínio arquitetural** em Engenharia de Dados.
+
+---
+
+# 🎯 Ideia central
+
+A maioria das pessoas usa Draw.io errado.
+
+Usam como **ferramenta de desenho**, quando na verdade deveria ser usado como:
+
+> **ferramenta de modelagem mental e comunicação de arquitetura**
+
+Diagramas bons não servem para ficar bonitos.
+
+Eles servem para responder perguntas como:
+
+* Como os dados entram?
+* Como os dados são transformados?
+* Como os dados estão modelados?
+* Como os dados chegam ao consumidor?
+
+---
+
+# 🧱 Tipos de diagramas que um Data Engineer precisa dominar
+
+Existem **5 tipos principais de diagramas** em engenharia de dados.
+
+Dominar esses 5 já coloca você muito acima da média.
+
+---
+
+# 1️⃣ Arquitetura de dados (macro)
+
+Mostra **a plataforma inteira**.
+
+### Pergunta respondida
+
+> Como os dados fluem na arquitetura?
+
+---
+
+## Exemplo — Lakehouse
+
+```
+Fontes
+  ↓
+Ingestão
+  ↓
+Bronze
+  ↓
+Silver
+  ↓
+Gold
+  ↓
+Consumo
+```
+
+---
+
+## Exemplo no stack AWS
+
+```
+Sistemas Origem
+    │
+    │
+    ▼
+EventBridge
+    │
+    ▼
+Step Functions
+    │
+    ▼
+Glue Jobs
+    │
+    ▼
+S3 Bronze
+    │
+    ▼
+Athena / Glue Transform
+    │
+    ▼
+S3 Silver
+    │
+    ▼
+Iceberg Gold
+    │
+    ▼
+QuickSight / APIs
+```
+
+---
+
+## Quando usar
+
+Sempre que quiser explicar:
+
+* a **plataforma de dados**
+* a **arquitetura lakehouse**
+* o **ecossistema de serviços**
+
+---
+
+# 2️⃣ Modelo Dimensional (Star Schema)
+
+Baseado na modelagem de **Ralph Kimball**.
+
+Referência clássica:
+
+* *The Data Warehouse Toolkit*
+
+---
+
+## Estrutura
+
+```
+           dim_cliente
+               │
+               │
+dim_data ─ fact_pagamentos ─ dim_produto
+               │
+               │
+        dim_escritorio
+```
+
+---
+
+## Elementos
+
+### Fact Table
+
+Guarda métricas.
+
+Exemplo:
+
+```
+fact_pagamentos
+```
+
+Colunas:
+
+```
+valor_pagamento
+quantidade
+dias_atraso
+```
+
+---
+
+### Dimension Tables
+
+Contexto para análise.
+
+Exemplo:
+
+```
+dim_cliente
+dim_produto
+dim_escritorio
+dim_data
+```
+
+---
+
+## Quando usar
+
+Para explicar:
+
+* modelagem analítica
+* data warehouse
+* marts
+* métricas
+
+---
+
+# 3️⃣ Pipeline de dados
+
+Mostra **o fluxo de processamento**.
+
+---
+
+## Exemplo
+
+```
+EventBridge
+    │
+    ▼
+Step Function
+    │
+    ▼
+Glue Job
+    │
+    ▼
+Tabela Silver
+    │
+    ▼
+Athena CTAS
+    │
+    ▼
+Tabela Gold
+```
+
+---
+
+## Pergunta respondida
+
+> Como os dados são processados?
+
+---
+
+## Útil para
+
+* debugging
+* explicar ETL
+* documentar pipelines
+
+---
+
+# 4️⃣ Modelo ER (Entity Relationship)
+
+Muito usado em **bancos transacionais**.
+
+---
+
+## Exemplo
+
+```
+Contrato
+   │
+   │ 1:N
+   │
+Parcela
+   │
+   │
+Pagamento
+```
+
+---
+
+## Usado para
+
+* modelagem de sistemas
+* bancos OLTP
+* relacionamento entre entidades
+
+---
+
+# 5️⃣ Fluxos analíticos (consultoria style)
+
+Muito usado por:
+
+* McKinsey
+* Deloitte
+* BCG
+* equipes de analytics
+
+---
+
+## Exemplo — fluxo de carteira
+
+```
+Carteira Inicial
+      │
+      ▼
+Segmentação
+      │
+      ▼
+Fila de Cobrança
+      │
+      ▼
+Eventos
+      │
+      ▼
+Status Final
+```
+
+---
+
+## Usado para
+
+* explicar processos de negócio
+* análises de carteira
+* funis de conversão
+* jornada de dados
+
+---
+
+# 🧠 Método profissional para desenhar diagramas
+
+---
+
+# 1️⃣ Defina a pergunta do diagrama
+
+Todo diagrama responde **uma pergunta específica**.
+
+| Pergunta                      | Diagrama    |
+| ----------------------------- | ----------- |
+| Como os dados chegam          | pipeline    |
+| Como os dados são modelados   | star schema |
+| Como as tabelas se relacionam | ER          |
+| Como a plataforma funciona    | arquitetura |
+
+---
+
+# 2️⃣ Defina o nível de abstração
+
+Regra:
+
+> **1 diagrama = 1 nível**
+
+---
+
+## Níveis
+
+```
+L1 → arquitetura
+L2 → pipeline
+L3 → modelagem
+L4 → tabela/colunas
+```
+
+Misturar tudo gera **diagramas impossíveis de ler**.
+
+---
+
+# 3️⃣ Padronize cores
+
+Exemplo profissional:
+
+```
+Azul   → fontes de dados
+Cinza  → dados crus
+Laranja → transformação
+Verde  → camada gold
+Roxo   → consumo
+```
+
+---
+
+# 4️⃣ Use agrupamentos
+
+Use **containers no Draw.io**.
+
+Exemplo:
+
+```
+Lakehouse
+   │
+   ├ Bronze
+   ├ Silver
+   └ Gold
+```
+
+---
+
+# 5️⃣ Nomeie corretamente
+
+Evite:
+
+```
+tabela_final
+dados_ok
+base1
+```
+
+Prefira:
+
+```
+stg_contratos
+silver_pagamentos
+fact_pagamentos
+dim_cliente
+gold_rollrate
+```
+
+---
+
+# 🧱 Estrutura ideal de um Lakehouse
+
+Modelo comum:
+
+```
+Fontes
+   │
+   ▼
+Ingestão
+   │
+   ▼
+BRONZE
+dados crus
+   │
+   ▼
+SILVER
+dados limpos
+   │
+   ▼
+GOLD
+métricas
+   │
+   ▼
+Consumo
+BI / APIs
+```
+
+---
+
+# 🧠 Exemplo aplicado (Athena + Glue)
+
+```
+Sistemas Jurídicos
+Pagamentos
+Boletos
+CRM
+
+      │
+      ▼
+EventBridge
+
+      │
+      ▼
+Step Functions
+
+      │
+      ▼
+Glue Jobs
+
+      │
+      ▼
+S3 Bronze
+
+      │
+      ▼
+Athena Transform
+
+      │
+      ▼
+S3 Silver
+
+      │
+      ▼
+Iceberg Gold
+
+      │
+      ▼
+QuickSight
+```
+
+---
+
+# 🧠 Boas práticas avançadas
+
+---
+
+# 1️⃣ Use layers
+
+Separe camadas no Draw.io.
+
+```
+Layer 1 → infraestrutura
+Layer 2 → dados
+Layer 3 → processos
+```
+
+---
+
+# 2️⃣ Use ícones oficiais
+
+AWS icons ajudam muito na leitura.
+
+Exemplo:
+
+```
+S3
+Glue
+Athena
+Step Functions
+EventBridge
+```
+
+---
+
+# 3️⃣ Separe por domínio
+
+Exemplo:
+
+```
+Domínio Cobrança
+Domínio Jurídico
+Domínio Financeiro
+```
+
+---
+
+# 4️⃣ Numere o fluxo
+
+Exemplo:
+
+```
+1 ingestão
+2 limpeza
+3 enriquecimento
+4 mart
+```
+
+Isso melhora **documentação e onboarding**.
+
+---
+
+# 🧠 Exercício poderoso
+
+Pegue um pipeline seu e desenhe **3 diagramas diferentes**.
+
+---
+
+## 1️⃣ Arquitetura
+
+```
+fontes → bronze → silver → gold
+```
+
+---
+
+## 2️⃣ Pipeline
+
+```
+eventbridge
+ → step function
+ → glue
+ → athena
+```
+
+---
+
+## 3️⃣ Modelagem
+
+```
+fact_pagamentos
+dim_cliente
+dim_data
+dim_escritorio
+```
+
+---
+
+# 🚀 Template de arquitetura para reutilizar
+
+```
+┌─────────────────────┐
+│       FONTES        │
+│ CRM                 │
+│ Boletos             │
+│ Pagamentos          │
+└──────────┬──────────┘
+           │
+           ▼
+┌─────────────────────┐
+│      INGESTÃO       │
+│ Glue / Lambda       │
+└──────────┬──────────┘
+           │
+           ▼
+┌─────────────────────┐
+│       BRONZE        │
+│ Dados crus          │
+└──────────┬──────────┘
+           │
+           ▼
+┌─────────────────────┐
+│       SILVER        │
+│ Dados tratados      │
+└──────────┬──────────┘
+           │
+           ▼
+┌─────────────────────┐
+│        GOLD         │
+│ Métricas            │
+└──────────┬──────────┘
+           │
+           ▼
+┌─────────────────────┐
+│      CONSUMO        │
+│ QuickSight / APIs   │
+└─────────────────────┘
+```
+
+---
+
+# 📚 Referências importantes
+
+Livros importantes para entender o **pensamento por trás da modelagem**:
+
+* Fundamentals of Data Engineering
+* The Data Warehouse Toolkit
+* Star Schema: The Complete Reference
+
+---
+
+# 🎯 Regra final
+
+Se um diagrama não responde claramente a pergunta:
+
+> **"o que está acontecendo com os dados?"**
+
+então ele falhou.
+
+---
+
+# 📌 Resumo mental
+
+Diagramas bons seguem:
+
+```
+pergunta clara
++
+nível único
++
+padrão visual
++
+nomes corretos
++
+fluxo legível
+```
+
+---
+
+Se quiser, posso também te gerar uma segunda nota:
+
+**"30 templates de diagramas de engenharia de dados para Draw.io"**
+
+com exemplos de:
+
+* lakehouse
+* data mesh
+* pipelines
+* SCD
+* CDC
+* streaming
+* arquitetura analytics moderna
+
+que é algo que **acelera absurdamente a documentação de pipelines Athena / Glue / Iceberg**.
