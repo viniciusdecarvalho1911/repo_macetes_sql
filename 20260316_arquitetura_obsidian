@@ -1,0 +1,872 @@
+Ótimo. Com suas respostas, dá para sair do abstrato e já montar uma **arquitetura-alvo de vault de equipe** bem clara.
+
+Seu cenário pede uma solução que seja ao mesmo tempo:
+
+* fácil para quem quase não conhece Obsidian
+* boa para leitura no dia a dia
+* editável por alguns
+* flexível sem virar bagunça
+* adequada para SharePoint
+* útil para documentação, processos, queries, tarefas e onboarding
+
+Pelo que você descreveu, eu **não faria uma vault “pessoal adaptada”**. Eu faria uma **vault institucional leve**, com cara de wiki operacional, e deixaria o Johnny.Decimal organizando **pastas macro**, não cada nota.
+
+---
+
+# Diagnóstico do seu caso
+
+Você tem alguns sinais clássicos de que precisa de refatoração estrutural:
+
+* conteúdo misturado
+* muitas notas de query e processo
+* algumas notas “monstro”
+* baixa familiaridade do time com Obsidian
+* leitura majoritária, edição minoritária
+* desejo de usar no SharePoint sem depender de expertise técnica
+
+Então a prioridade não é “fazer uma vault poderosa”.
+A prioridade é **fazer uma vault compreensível**.
+
+---
+
+# Decisão central de arquitetura
+
+## Eu recomendo este modelo:
+
+**Johnny.Decimal nas pastas principais e intermediárias**
+**Tipos de nota padronizados dentro delas**
+**Metadados YAML para classificação transversal**
+**páginas índice para navegação humana**
+**separação clara entre equipe e pessoal**
+
+Ou seja:
+
+* pastas = navegação estrutural
+* notas = conteúdo real
+* metadados = filtro e relacionamento
+* índices = experiência de leitura
+* área privada = seu laboratório pessoal
+
+---
+
+# Arquitetura proposta da vault
+
+## Estrutura macro
+
+```text
+00_administração-vault
+10_navegação-e-onboarding
+20_conhecimento-negocio
+30_sistemas-e-fontes
+40_consulta-tecnica
+50_processos-e-rotinas
+60_operacao-e-suporte
+70_projetos-e-melhorias
+80_reunioes-e-decisoes
+90_arquivo-e-temporarios
+95_area-pessoal-curadoria
+99_anexos
+```
+
+Essa estrutura atende muito bem seu caso porque organiza por **tipo de conteúdo**, que foi exatamente o que você disse que prefere no Johnny.Decimal.
+
+---
+
+# Como cada pasta funcionaria
+
+## 00_administração-vault
+
+Aqui fica a “governança da wiki”.
+
+Exemplos:
+
+* como usar a vault
+* padrões de nome
+* padrões de metadados
+* templates
+* regras de criação de notas
+* convenções de links
+* changelog estrutural da vault
+
+Notas exemplo:
+
+* `como-usar-esta-vault`
+* `padrao-de-nomenclatura`
+* `padrao-de-metadados`
+* `templates-oficiais`
+* `guia-de-curadoria`
+
+---
+
+## 10_navegação-e-onboarding
+
+É a porta de entrada de qualquer pessoa nova.
+
+Exemplos:
+
+* home da equipe
+* índice geral
+* mapa de conteúdo
+* onboarding para novos membros
+* FAQ
+* como encontrar uma query
+* como encontrar um processo
+
+Notas exemplo:
+
+* `home`
+* `indice-geral`
+* `onboarding-analistas`
+* `onboarding-negocio`
+* `como-encontrar-informacoes`
+* `faq`
+
+Essa pasta é crítica porque seu time tem pouca familiaridade com Obsidian.
+
+---
+
+## 20_conhecimento-negocio
+
+Aqui entra o conhecimento de domínio.
+
+Exemplos:
+
+* conceitos de cobrança
+* recuperação judicial
+* comissionamento
+* esteiras
+* regras de negócio
+* glossário operacional
+
+Subpastas possíveis:
+
+```text
+20_conhecimento-negocio/
+  21_glossario
+  22_regras-de-negocio
+  23_dominios
+  24_metricas-de-negocio
+```
+
+Notas exemplo:
+
+* `conceito-de-colchao`
+* `regra-de-comissionamento-vijud`
+* `glossario-cobranca`
+* `definicao-de-regularizacao`
+
+---
+
+## 30_sistemas-e-fontes
+
+Aqui fica a visão dos sistemas usados.
+
+Exemplos:
+
+* Athena
+* Glue
+* Step Functions
+* S3
+* QuickSight
+* SharePoint
+* bases externas
+
+Subpastas:
+
+```text
+30_sistemas-e-fontes/
+  31_aws
+  32_fontes-de-dados
+  33_consumo
+```
+
+Notas exemplo:
+
+* `athena-visao-geral`
+* `glue-visao-geral`
+* `step-functions-visao-geral`
+* `quicksight-visao-geral`
+* `fontes-externas`
+
+---
+
+## 40_consulta-tecnica
+
+Essa tende a ser uma das maiores no seu caso.
+
+Ela guarda notas consultivas e técnicas, principalmente de query e objeto de dados.
+
+Subpastas:
+
+```text
+40_consulta-tecnica/
+  41_queries
+  42_tabelas
+  43_views
+  44_modelos
+  45_snippets-e-padroes
+```
+
+Notas exemplo:
+
+* `query-carteira-colchao-base`
+* `query-roll-rate-validacao`
+* `tabela-cobranca-pagamentos`
+* `view-carteira-ativa`
+* `padrao-scd2-athena`
+* `snippet-deduplicacao`
+
+---
+
+## 50_processos-e-rotinas
+
+Aqui entra o “como as coisas funcionam”.
+
+Subpastas:
+
+```text
+50_processos-e-rotinas/
+  51_processos-de-negocio
+  52_pipelines-de-dados
+  53_fluxos-operacionais
+  54_agendamentos
+```
+
+Notas exemplo:
+
+* `processo-atualizacao-carteira`
+* `pipeline-carga-pagamentos`
+* `fluxo-validacao-commissionamento`
+* `rotina-diaria-de-acompanhamento`
+
+Essa pasta conversa muito com 40, mas a diferença é:
+
+* 40 = objeto técnico
+* 50 = fluxo/processo
+
+---
+
+## 60_operacao-e-suporte
+
+Para runbooks, troubleshooting e incidentes.
+
+Subpastas:
+
+```text
+60_operacao-e-suporte/
+  61_runbooks
+  62_incidentes
+  63_troubleshooting
+  64_checklists
+```
+
+Notas exemplo:
+
+* `runbook-falha-em-particao-athena`
+* `troubleshooting-query-lenta`
+* `checklist-reprocessamento`
+* `incidente-atraso-carga`
+
+---
+
+## 70_projetos-e-melhorias
+
+Área para evolução e trabalho em curso.
+
+Subpastas:
+
+```text
+70_projetos-e-melhorias/
+  71_projetos-ativos
+  72_backlog
+  73_melhorias
+  74_entregas-concluidas
+```
+
+Notas exemplo:
+
+* `projeto-refatoracao-carteira`
+* `backlog-documentacao`
+* `melhoria-catalogo-athena`
+* `entrega-painel-executivo`
+
+---
+
+## 80_reunioes-e-decisoes
+
+Guarda histórico decisório.
+
+Subpastas:
+
+```text
+80_reunioes-e-decisoes/
+  81_reunioes
+  82_decisoes
+  83_adrs
+```
+
+Notas exemplo:
+
+* `reuniao-time-dados-2026-03-16`
+* `decisao-padrao-nomenclatura`
+* `adr-uso-de-johnny-decimal`
+
+---
+
+## 90_arquivo-e-temporarios
+
+Para não misturar legado com material vivo.
+
+Subpastas:
+
+```text
+90_arquivo-e-temporarios/
+  91_legado
+  92_rascunhos
+  93_importacoes
+  94_obsoleto
+```
+
+---
+
+## 95_area-pessoal-curadoria
+
+Como você quer separar equipe e pessoal, eu faria isso explícito.
+
+Aqui pode ficar:
+
+* suas anotações intermediárias
+* rascunhos de curadoria
+* laboratório
+* refatorações em andamento
+* notas pessoais não publicáveis
+
+Importante: essa pasta existe dentro da vault só se fizer sentido operacional.
+Se quiser máxima limpeza, o ideal é outra vault pessoal.
+
+---
+
+## 99_anexos
+
+Tudo que for imagem, pdf, drawio, arquivos auxiliares.
+
+Subpastas:
+
+```text
+99_anexos/
+  imagens
+  pdfs
+  diagramas
+  planilhas
+```
+
+---
+
+# Regra de ouro para sua equipe
+
+Como o time tem pouca familiaridade com Obsidian, a experiência precisa funcionar assim:
+
+1. a pessoa abre a Home
+2. entende onde está cada coisa
+3. entra por uma área índice
+4. acha a nota por tema ou tipo
+5. não precisa saber Dataview nem backlink para navegar
+
+---
+
+# Modelo de navegação que eu recomendo
+
+## 1. Uma Home principal
+
+A nota mais importante da vault.
+
+Exemplo de seções:
+
+* o que é esta vault
+* atalhos rápidos
+* áreas principais
+* conteúdos mais acessados
+* onde achar queries
+* onde achar processos
+* onde achar runbooks
+* últimos conteúdos relevantes
+
+## 2. Uma Home por pasta principal
+
+Cada pasta principal tem sua nota índice.
+
+Exemplo:
+
+* `10_navegação-e-onboarding/home`
+* `40_consulta-tecnica/home`
+* `50_processos-e-rotinas/home`
+
+## 3. Índices por subárea
+
+Exemplo:
+
+* índice de queries
+* índice de tabelas
+* índice de processos
+* índice de runbooks
+
+---
+
+# Tipos oficiais de nota
+
+Como você quer templates obrigatórios, eu fecharia um conjunto pequeno e claro.
+
+## Tipos recomendados
+
+* home
+* índice
+* conceito
+* regra_de_negocio
+* query
+* tabela
+* view
+* processo
+* pipeline
+* runbook
+* checklist
+* projeto
+* reunião
+* decisão
+* métrica
+
+Isso já cobre quase tudo que você descreveu.
+
+---
+
+# Campos YAML que eu recomendo padronizar
+
+Você disse que ainda não usa muito, mas quer usar.
+Então eu faria um padrão simples, não exagerado.
+
+## Padrão base
+
+```yaml
+---
+titulo: ""
+tipo: ""
+status: rascunho
+owner: ""
+area: ""
+sistema: ""
+dominio: ""
+tags: []
+atualizado_em: 2026-03-16
+publico: equipe
+---
+```
+
+## Campos importantes
+
+* `tipo`: query, processo, tabela, runbook etc.
+* `status`: rascunho, ativo, revisao, obsoleto
+* `owner`: responsável principal
+* `area`: dados, negocio, cobranca, etc.
+* `sistema`: athena, glue, quicksight, sharepoint
+* `dominio`: pagamentos, carteira, vijud, comissionamento
+* `publico`: equipe ou pessoal
+
+---
+
+# Templates mínimos que eu criaria já
+
+## Template de query
+
+````yaml
+---
+tipo: query
+status: ativo
+owner: ""
+area: dados
+sistema: athena
+dominio: ""
+tags: [query]
+atualizado_em: 2026-03-16
+publico: equipe
+---
+
+# Objetivo
+
+# Contexto
+
+# Query
+
+```sql
+
+````
+
+# Entradas principais
+
+# Saídas principais
+
+# Premissas
+
+# Dependências
+
+# Observações
+
+# Notas relacionadas
+
+````
+
+## Template de processo
+```yaml
+---
+tipo: processo
+status: ativo
+owner: ""
+area: dados
+sistema: ""
+dominio: ""
+tags: [processo]
+atualizado_em: 2026-03-16
+publico: equipe
+---
+
+# Objetivo
+
+# Visão geral
+
+# Gatilho
+
+# Entradas
+
+# Etapas
+
+# Saídas
+
+# Regras de negócio
+
+# Riscos / pontos de atenção
+
+# Troubleshooting
+
+# Notas relacionadas
+````
+
+## Template de tabela
+
+```yaml
+---
+tipo: tabela
+status: ativo
+owner: ""
+area: dados
+sistema: athena
+dominio: ""
+tags: [tabela]
+atualizado_em: 2026-03-16
+publico: equipe
+---
+
+# Descrição
+
+# Camada
+
+# Origem
+
+# Chaves principais
+
+# Colunas relevantes
+
+# Partições
+
+# Regras importantes
+
+# Exemplos de uso
+
+# Dependências
+
+# Consumidores
+
+# Notas relacionadas
+```
+
+## Template de runbook
+
+```yaml
+---
+tipo: runbook
+status: ativo
+owner: ""
+area: dados
+sistema: ""
+dominio: ""
+tags: [runbook]
+atualizado_em: 2026-03-16
+publico: equipe
+---
+
+# Quando usar
+
+# Sintoma
+
+# Causa provável
+
+# Passo a passo
+
+# Validação
+
+# Escalonamento
+
+# Notas relacionadas
+```
+
+---
+
+# Convenção de nomes
+
+Como você quer SharePoint + Obsidian + equipe leiga, eu evitaria nomes “criativos”.
+
+Use nomes previsíveis.
+
+## Para pastas
+
+No formato:
+`numero_nome`
+
+Exemplo:
+
+* `40_consulta-tecnica`
+* `41_queries`
+* `52_pipelines-de-dados`
+
+## Para notas
+
+Sem numeração Johnny.Decimal nas notas.
+Só nome claro.
+
+Exemplo:
+
+* `home`
+* `indice-de-queries`
+* `query-carteira-colchao-base`
+* `processo-fechamento-mensal`
+* `runbook-erro-em-particao-athena`
+
+Isso deixa o JD nas pastas e evita rigidez excessiva nas notas.
+
+---
+
+# Como lidar com as notas “monstro”
+
+Você comentou que existem.
+Eu trataria isso como uma das primeiras frentes da refatoração.
+
+## Regra prática
+
+Se a nota mistura:
+
+* contexto
+* query
+* processo
+* regra de negócio
+* troubleshooting
+
+ela deve ser quebrada.
+
+## Divisão recomendada
+
+Uma nota monstro vira um pequeno conjunto:
+
+* uma nota principal de visão geral
+* uma nota de processo
+* uma ou mais notas de query
+* uma nota de regra de negócio
+* uma nota de runbook, se houver operação
+
+Exemplo:
+
+Antes:
+
+* `validacao-carteira-geral.md`
+
+Depois:
+
+* `processo-validacao-carteira.md`
+* `query-validacao-carteira-base.md`
+* `query-validacao-carteira-divergencias.md`
+* `regra-de-negocio-validacao-carteira.md`
+* `runbook-validacao-carteira.md`
+
+---
+
+# Como eu faria a separação equipe vs pessoal
+
+Você disse que quer isso claramente separado.
+
+## Opção mais limpa
+
+Duas vaults:
+
+* vault equipe
+* vault pessoal
+
+## Opção mais prática no começo
+
+Uma pasta isolada:
+
+* `95_area-pessoal-curadoria`
+
+Com regra:
+
+* nada dali entra em índice geral
+* nada dali é referência oficial
+* dali saem materiais que depois viram conteúdo oficial
+
+Para fase de transição, essa segunda opção é boa.
+
+---
+
+# Fluxo de contribuição que eu recomendo
+
+Como todos poderão criar, mas você será o principal curador no início, o ideal é ter um fluxo simples:
+
+## Regra operacional
+
+Quem criar nota nova precisa:
+
+* usar template
+* colocar tipo
+* colocar owner
+* colocar status
+* colocar área correta
+* linkar para pelo menos uma nota índice
+
+## Curadoria
+
+Você revisa:
+
+* nome
+* pasta
+* template
+* duplicidade
+* clareza
+
+---
+
+# O que eu faria com suas 300 notas atuais
+
+Eu não tentaria “organizar tudo de uma vez”.
+
+Faria em ondas.
+
+## Onda 1 — Estrutura nova
+
+Criar:
+
+* pastas novas
+* home principal
+* índices principais
+* templates
+* padrão YAML
+
+## Onda 2 — Conteúdo crítico
+
+Migrar primeiro:
+
+* processos mais usados
+* queries mais usadas
+* notas mais acessadas
+* runbooks essenciais
+* onboarding
+
+## Onda 3 — Higienização
+
+* quebrar notas monstro
+* remover duplicadas
+* arquivar obsoletas
+* reclassificar o restante
+
+## Onda 4 — Legado
+
+Mover o que sobrou para:
+
+* `90_arquivo-e-temporarios/91_legado`
+
+---
+
+# Estratégia de mapeamento das notas antigas
+
+Crie uma planilha simples com colunas assim:
+
+* nome atual
+* pasta atual
+* tipo novo
+* destino novo
+* ação
+* prioridade
+
+Exemplo:
+
+| nome atual          | pasta atual | tipo novo        | destino novo | ação       | prioridade |
+| ------------------- | ----------- | ---------------- | ------------ | ---------- | ---------- |
+| carteira_base_final | queries     | query            | 40/41        | migrar     | alta       |
+| fluxo_carteira      | docs        | processo         | 50/51        | reescrever | alta       |
+| regras_vijud        | soltas      | regra_de_negocio | 20/22        | revisar    | média      |
+| reuniao antiga      | notas       | reunião          | 80/81        | arquivar   | baixa      |
+
+---
+
+# Seu modelo-alvo resumido
+
+Se eu condensar toda a recomendação para o seu caso, fica assim:
+
+## Estrutura
+
+Johnny.Decimal em pastas macro e intermediárias
+
+## Organização
+
+Por tipo de conteúdo, não por tema puro
+
+## Navegação
+
+Home + índices + links claros
+
+## Padronização
+
+Templates obrigatórios + YAML simples
+
+## Governança
+
+Flexível na criação, centralizada na curadoria
+
+## Refatoração
+
+Por ondas, sem tentar arrumar as 300 notas de uma vez
+
+## Pessoal vs equipe
+
+Separação explícita
+
+---
+
+# Minha sugestão de primeira entrega concreta
+
+Eu montaria primeiro estes 12 itens:
+
+1. árvore de pastas oficial
+2. home principal
+3. índice geral
+4. template de query
+5. template de processo
+6. template de tabela
+7. template de runbook
+8. padrão YAML
+9. convenção de nomes
+10. regra de arquivamento
+11. regra de criação de nota
+12. planilha de migração antigo → novo
+
+Posso te devolver isso já no próximo passo em formato **pronto para colar no Obsidian**, com:
+
+* árvore completa de pastas
+* conteúdo da Home
+* templates em markdown
+* padrão de metadados
+* checklist de migração da vault atual.
