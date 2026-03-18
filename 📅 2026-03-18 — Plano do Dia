@@ -1,0 +1,239 @@
+## 🧠 Contexto do Dia
+
+- Foco: **Pagadoria + Disparos + Estruturação Pipeline + Comunicação**
+    
+- Objetivo: **Destravar fluxos + garantir execuções + preparar automação**
+    
+
+---
+
+# 🧩 Kanban do Dia
+
+```dataview
+TASK
+FROM "Daily"
+WHERE !completed
+GROUP BY kanban_status
+```
+
+---
+
+# 🚀 Execução — Prioridade Alta
+
+## 🧾 Pagadoria ADM Processual
+
+1.  Verificar aceite do Mourato (tentativa inicial Nova Quest)  
+    1. [kanban_status::doing]
+    
+2.  Verificar aceite do Mourato (nova tentativa Nova Quest)  
+    1. [kanban_status::doing]
+    
+3.  Tentar realizar folha de serviço sem Nova Quest  
+    1. [kanban_status::doing]
+    
+4.  Se passo 1 ou 2 OK → gerar folha Nova Quest  
+    1. [kanban_status::todo]
+    
+5.  Enviar aceite (casos sem Nova Quest)  
+    1. [kanban_status::todo]
+    
+6.  Enviar aceite (casos Nova Quest)   
+    1. [kanban_status::todo]
+    
+
+---
+
+## ⚖️ Pagadoria Jud Processual
+
+1.  Avisar Caio sobre subida da pagadoria  
+    1. [kanban_status::todo]
+    
+2.  Sinalizar Iza sobre pagadoria Jud  
+    1. [kanban_status::todo]
+    
+3.  Começar Impugnações (se houver tempo)  
+    1. [kanban_status::backlog]
+    
+
+---
+
+# 💰 Operacional / Execução de Bases
+
+1.  Fazer casos de Ressarcimento Perez (tj_RJ)  
+    1. [kanban_status::todo]
+    
+2.  Disparar base de RV para escritórios ADM  
+    1. [kanban_status::todo]
+    
+3.  Validar atualização base Serasa  
+    1. [kanban_status::todo]
+    
+4.  Marcar horário com Jon e Gabi (disparo Jud)  
+    1. [kanban_status::todo]
+    
+5.  Validar meta Colchão com Gabi + ensinar ajuste  
+    1. [kanban_status::todo]
+    
+
+---
+
+# 🧠 Comunicação Estratégica
+
+## 📌 Recuperação Judicial
+
+-  Alinhar com Wender, Jon e Gui:
+    
+    - Visão processual por:
+        
+        - Pasta
+            
+        - Contrato
+            
+        - Produto
+            
+        - CNPJ
+            
+    - Identificar:
+        
+        - Pastas indevidas
+            
+        - Comportamento Execução
+            
+        - Movimentações e gatilhos
+            
+
+---
+
+## 📌 Custos Sob Gestão
+
+-  Passar contexto para Iza
+    
+-  Rodar prévia (se possível)
+    
+
+---
+
+# 📊 GESC ADM — Pipeline
+
+-  Regul vs meta (escritório / fila / mês)  
+    [kanban_status::todo]
+    
+
+### 🔧 Steps
+
+1.  Trocar OPC
+    
+2.  Trocar variáveis
+    
+3.  Rodar código Colchão
+    
+4.  Rodar Novos Negócios
+    
+5.  Calcular Colchão + Novos Negócios
+    
+6.  Calcular share (CNPJs distintos)
+    
+7.  Perde/Ganha de share por escritório
+    
+
+---
+
+# ⚠️ Demandas Adicionais
+
+-  Atender pedido do Bispo (Reclamação)  
+    [kanban_status::todo]
+    
+
+---
+
+# 🏗️ Projeto — Template Jud + Automação
+
+## 🎯 Objetivo
+
+Criar pipeline completo de disparo + automação
+
+### 🔹 Entradas
+
+1. Variáveis início processo
+    
+2. RecJud / Vijud consolidado / comissão
+    
+3. Base Colchão (consolidada + comissão)
+    
+4. Bases de disparo
+    
+
+### 🔹 Saídas
+
+- Variáveis fim processo
+    
+
+### 🔹 Execução
+
+1.  Criar fluxo completo
+    
+2.  Atrelar em Step Function
+    
+3.  Agendar no EventBridge
+    
+
+---
+
+# 🧱 Estrutura de Dados — Painel
+
+## 📊 Carteira
+
+### VIJUD
+
+- Grão: `anomes, contrato, produto, pasta`
+    
+- PCA + campos calculados
+    
+
+### Colchão
+
+- Grão: `anomes, contrato, produto, pasta`
+    
+- PCA + campos calculados
+    
+
+---
+
+## 🧩 Suporte
+
+### OPC
+
+- Grão: `anomes, contrato, produto, pasta, WO`
+    
+
+### Boletos Pagos
+
+- Grão: `boleto, contrato, produto`
+    
+
+---
+
+## 💳 Pagadoria Vijud + Colchão + Demais
+
+### Geral
+
+- Grão: `anomes, contrato, produto, pasta, dt_pagamento, boleto`
+    
+- Campos:
+    
+    - placeholder boleto
+        
+    - flag
+        
+    - origem calculada
+        
+
+---
+
+# 🧠 Melhoria Contínua
+
+-  Ajeitar Obsidian para conhecimento compartilhado  
+    [kanban_status::backlog]
+    
+
+---
