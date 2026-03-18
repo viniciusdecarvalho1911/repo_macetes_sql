@@ -234,6 +234,47 @@ Criar pipeline completo de disparo + automação
 
 -  Ajeitar Obsidian para conhecimento compartilhado  
     [kanban_status::backlog]
+
+
+
+Oi Iza, tudo bem?
+
+Queria te dar uma visão do que estou priorizando nas próximas execuções, principalmente em relação à pagadoria e aos fluxos operacionais:
+
+**1. Pagadoria ADM (prioridade imediata)**
+
+* Estou validando os retornos do Mourato sobre as tentativas com a Nova Quest
+* Em paralelo, vou tentar rodar a folha de serviço sem a Nova Quest para não travar o fluxo
+* Dependendo do cenário (com ou sem Nova Quest), sigo com a geração das folhas e envio dos aceites
+
+**2. Pagadoria Jud**
+
+* Vou te sinalizar e também avisar o Caio assim que a subida estiver validada
+* Se houver janela, começo a avançar nas impugnações
+
+**3. Disparos e validações operacionais**
+
+* Disparo de base de RV para escritórios ADM
+* Validação da atualização da base Serasa
+* Alinhamento com Jon e Gabi para o disparo do Jud
+* Verificação da meta de Colchão com a Gabi (e apoio no ajuste, se necessário)
+
+**4. Estruturação de fluxo (Jud / Colchão / RecJud)**
+
+* Estou estruturando um template consolidado de disparo (bases + variáveis + comissão)
+* A ideia é evoluir isso para um fluxo automatizado via Step Function + EventBridge
+
+**5. GESC ADM**
+
+* Vou rodar o processo completo de cálculo (Colchão + Novos Negócios), incluindo share por escritório e análise de perde/ganha
+
+**6. Contextos adicionais**
+
+* Vou compartilhar com o time (Wender, Jon e Gui) uma visão mais estruturada de Recuperação Judicial no nível de oportunidade (CNPJ), incluindo comportamento de pastas e gatilhos
+* Também posso te passar um contexto inicial de Custos Sob Gestão e, se possível, já rodar uma prévia
+
+Se tiver alguma prioridade diferente ou quiser direcionar algum ponto específico, me avisa que ajusto aqui 👍
+
     
 
 ---
