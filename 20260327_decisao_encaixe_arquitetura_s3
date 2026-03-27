@@ -420,3 +420,447 @@ E para decidir entre **view** e **tabela**:
 > se não é reutilizado, fica como query.**
 
 Se você quiser, no próximo passo eu posso transformar isso em um **fluxograma ASCII mais bonito**, ou numa **árvore de decisão em markdown com exemplos do seu processo de pagamentos consolidados**.
+-----
+
+
+Perfeito. Vou te entregar as **duas coisas**:
+
+1. um **fluxograma ASCII mais bonito**
+2. uma **árvore de decisão em markdown com exemplos do seu processo de pagamentos consolidados**
+
+Vou manter a lógica alinhada com o framework que você consolidou de **parâmetros → base → satélites → enriquecimento → regra → agregação → output**, além das regras de quando algo deve virar view ou continuar na query. O seu texto-base já deixa claro que coisas estáveis e repetidas tendem a virar view, enquanto recortes específicos, período e KPI do momento tendem a ficar na query; também reforça que join repetido em 5 queries “quer virar view”. 
+
+Também vou usar a distinção que amarramos antes:
+
+* **view** = lógica reutilizável, mas sem gravar dados
+* **CTAS/tabela** = grava resultado em S3, útil para performance e reuso pesado no Athena  
+
+---
+
+# 1. Fluxograma ASCII — decisão de enquadramento
+
+```text
+┌──────────────────────────────────────────────────────────────┐
+│ INÍCIO: surgiu uma lógica nova, tabela nova, view nova      │
+│ ou transformação nova.                                      │
+└──────────────────────────────────────────────────────────────┘
+                           |
+                           v
+         ┌───────────────────────────────────────────┐
+         │ Isso será reutilizado em mais de uma      │
+         │ análise, painel, processo ou pipeline?    │
+         └───────────────────────────────────────────┘
+                    |                      |
+                  NÃO                     SIM
+                    |                      |
+                    v                      v
+   ┌────────────────────────────┐   ┌────────────────────────────────────┐
+   │ É algo pontual, explorató- │   │ Isso só padroniza a origem?        │
+   │ rio, debug ou investigação?│   │ - nomes                            │
+   └────────────────────────────┘   │ - tipos                            │
+          |               |         │ - partições                        │
+         SIM             NÃO        │ - chaves                           │
+          |               |         │ - colunas temporais canônicas      │
+          v               v         └────────────────────────────────────┘
+┌──────────────────┐   ┌──────────────────────┐         |             |
+│ QUERY AD HOC /   │   │ REAVALIAR O PROPÓ-   │        SIM           NÃO
+│ CTE LOCAL        │   │ SITO                 │         |             |
+└──────────────────┘   └──────────────────────┘         v             v
+                                            ┌────────────────────┐   ┌──────────────────────────────┐
+                                            │ Recalcular isso    │   │ Isso harmoniza várias fontes │
+                                            │ sempre é barato?   │   │ para um modelo comum?       │
+                                            └────────────────────┘   │ - contrato/produto/mês       │
+                                                  |        |         │ - escritório                 │
+                                                 SIM      NÃO        │ - dedup                      │
+                                                  |        |         │ - padrão temporal           │
+                                                  v        v         └──────────────────────────────┘
+                                      ┌────────────────┐  ┌────────────────┐       |             |
+                                      │ VW_BASE_*      │  │ TB_SLV_BASE_*  │      SIM           NÃO
+                                      └────────────────┘  └────────────────┘       |             |
+                                                                                     v             v
+                                                   ┌────────────────────────────────────────┐  ┌──────────────────────────────┐
+                                                   │ Isso será usado por várias camadas     │  │ Isso define um conceito de   │
+                                                   │ depois?                                │  │ negócio estável?             │
+                                                   └────────────────────────────────────────┘  │ - carteira elegível          │
+                                                              |              |                 │ - pagamento consolidado      │
+                                                             SIM            NÃO                │ - regul / caixa              │
+                                                              |              |                 │ - status do contrato         │
+                                                              v              v                 └──────────────────────────────┘
+                                                   ┌────────────────┐  ┌────────────────┐             |             |
+                                                   │ TB_SLV_CAN_*   │  │ VW_CAN_*       │            SIM           NÃO
+                                                   └────────────────┘  └────────────────┘             |             |
+                                                                                                       v             v
+                                                                      ┌──────────────────────────────────────────┐  ┌──────────────────────────────┐
+                                                                      │ Ainda está amadurecendo / muda muito?   │  │ Isso já responde uma         │
+                                                                      └──────────────────────────────────────────┘  │ pergunta analítica pronta?   │
+                                                                                  |                 |               │ - pagadoria mês             │
+                                                                                 SIM               NÃO              │ - fluxo mensal              │
+                                                                                  |                 |               │ - quebra                    │
+                                                                                  v                 v               │ - comissão                  │
+                                                                        ┌────────────────┐  ┌────────────────────┐ └──────────────────────────────┘
+                                                                        │ VW_SEM_*       │  │ É base oficial,    │           |             |
+                                                                        └────────────────┘  │ recorrente, QS,    │          SIM           NÃO
+                                                                                             │ fechamento?        │           |             |
+                                                                                             └────────────────────┘           v             v
+                                                                                                 |            |        ┌────────────────┐  ┌────────────────────────────┐
+                                                                                                SIM          NÃO       │ TB_GLD_ANL_*   │  │ Isso só traduz nomes e    │
+                                                                                                 |            |        └────────────────┘  │ métricas para o usuário?  │
+                                                                                                 v            v                              └────────────────────────────┘
+                                                                                      ┌────────────────┐  ┌────────────────┐                     |            |
+                                                                                      │ TB_GLD_SEM_*   │  │ VW_SEM_*       │                    SIM          NÃO
+                                                                                      └────────────────┘  └────────────────┘                     |            |
+                                                                                                                                                  v            v
+                                                                                                                                    ┌────────────────────────┐  ┌────────────────────┐
+                                                                                                                                    │ SEMANTIC LAYER FINAL  │  │ REAVALIAR O        │
+                                                                                                                                    │ VIEW BI / DATASET QS  │  │ PROPÓSITO          │
+                                                                                                                                    └────────────────────────┘  └────────────────────┘
+```
+
+---
+
+# 2. Árvore de decisão em markdown com exemplos do seu processo
+
+## Pergunta 1: é pontual ou vai reaparecer?
+
+### Se for pontual
+
+Use:
+
+* query ad hoc
+* CTE local
+
+### Exemplo do seu processo
+
+“Quero só testar se a exclusão de vijud do início do mês muda muito o resultado de fevereiro.”
+
+Isso provavelmente fica só numa query de teste.
+
+---
+
+## Pergunta 2: isso só padroniza a origem?
+
+Sinais de que é **base**:
+
+* renomeia colunas
+* tipa corretamente
+* cria `p_*`
+* cria `mes_ref_yyyymm`
+* preserva partição
+* não muda o significado do negócio
+
+### Exemplo
+
+`vw_base_boletos_pagos`
+
+Porque ela só deveria:
+
+* expor `p_dt_ref`
+* expor `dt_ref_yyyymmdd`
+* normalizar `contrato`
+* normalizar `produto`
+* expor `boleto`
+* expor `vl_pago`
+* expor `flag_cancelado`
+
+### Decisão
+
+Se for leve:
+
+* `vw_base_boletos_pagos`
+
+Se estiver pesado e muito usado:
+
+* `tb_slv_base_boletos_pagos`
+
+Esse encaixe conversa bem com a ideia do seu texto de que base e satélites devem ter função clara e nomes previsíveis, como `base_*` e `sat_*`.  
+
+---
+
+## Pergunta 3: isso harmoniza várias fontes num idioma comum?
+
+Sinais de que é **canônica**:
+
+* junta boleto, débito em conta e back office
+* cria layout único
+* resolve dedup
+* resolve chaves comuns
+* padroniza tempo entre fontes
+
+### Exemplo
+
+`tb_slv_can_pagamento_evento`
+
+Ela poderia ter:
+
+* `contrato`
+* `produto`
+* `boleto`
+* `origem_pagamento`
+* `dt_ref_yyyymmdd`
+* `mes_ref_yyyymm`
+* `vl_pago`
+* `id_evento_origem`
+* `flag_cancelado`
+* `ordem_precedencia_origem`
+
+### Decisão
+
+Quase sempre isso tende a virar:
+
+* `tb_slv_can_*`
+
+Porque harmonização cross-source e dedup costumam ser caras e muito reaproveitadas.
+
+---
+
+## Pergunta 4: isso já representa um conceito de negócio estável?
+
+Sinais de que é **semântica**:
+
+* o negócio reconhece o nome
+* a regra já tem “cara de política”
+* mistura múltiplas regras para formar uma entidade de negócio
+
+### Exemplo 1
+
+`vw_sem_carteira_elegivel_pagamento`
+
+Regra:
+
+* vigor do mês
+* menos colchão
+* menos vijud do início do mês
+
+### Exemplo 2
+
+`vw_sem_pagamento_consolidado`
+
+Regra:
+
+* une fontes
+* deduplica
+* considera cancelamento
+* define desconto final
+* classifica `tp_acordo`
+* deriva `vl_caixa` e `vl_regul`
+
+### Decisão
+
+Se ainda muda muito:
+
+* `vw_sem_*`
+
+Se já é oficial para rotina, comissão ou fechamento:
+
+* `tb_gld_sem_*`
+
+---
+
+## Pergunta 5: isso já responde uma pergunta analítica pronta?
+
+Sinais de que é **analítica**:
+
+* já está no grão do painel
+* já responde a pergunta de negócio
+* já está quase pronto para QuickSight
+
+### Exemplo 1
+
+`tb_gld_anl_pagadoria_escritorio_mes`
+
+Colunas:
+
+* `mes_ref_yyyymm`
+* `escritorio`
+* `qtd_contratos_pagantes`
+* `vl_caixa`
+* `vl_regul`
+* `vl_meta_regul`
+* `perc_atingimento`
+* `gate`
+* `perc_comissao`
+* `vl_comissao`
+
+### Exemplo 2
+
+`tb_gld_anl_fluxo_mensal`
+
+Colunas:
+
+* `mes_ref_yyyymm`
+* `escritorio`
+* `fila`
+* `qtd_entrou`
+* `qtd_saiu`
+* `qtd_permaneceu`
+
+### Decisão
+
+Se vai para BI, rotina, painel ou comitê:
+
+* `tb_gld_anl_*`
+
+Se for mais leve e temporário:
+
+* `vw_anl_*`
+
+Aqui vale lembrar a recomendação clássica de não misturar diferentes níveis de agregação na mesma tabela, porque isso cria risco real de dupla contagem. Adamson é bem direto nisso. 
+
+---
+
+## Pergunta 6: isso só traduz nomes e métricas para o usuário final?
+
+Sinais de que é **semantic layer final**:
+
+* muda pouco a física
+* muda muito a compreensão
+* deixa o dado mais amigável
+* governa métricas
+
+### Exemplo
+
+`vw_qs_pagadoria_final`
+
+Traduz:
+
+* `vl_regul` → `Regularização`
+* `vl_caixa` → `Caixa`
+* `perc_atingimento` → `% Atingimento`
+* `vl_comissao` → `Comissão Estimada`
+
+Ou então isso pode nem ser uma view, e sim:
+
+* dataset no QuickSight
+* camada de cálculo governado no BI
+
+Adamson descreve semantic layer exatamente como essa ponte entre a visão de negócio e as estruturas físicas, escondendo tabelas e joins do usuário final. 
+
+---
+
+# 3. Mapa do seu processo de pagamentos consolidados
+
+## Bronze
+
+Raw de cada origem:
+
+* boletos pagos
+* débito em conta
+* fluxo apartado
+* carteira vigor
+* colchão
+* vijud
+* proposta de negócio
+* meta
+* gate
+
+## Silver-base
+
+Padronização de cada origem:
+
+* `vw_base_boletos_pagos`
+* `vw_base_debito_conta`
+* `vw_base_fluxo_apartado`
+* `vw_base_carteira_vigor`
+* `vw_base_colchao`
+* `vw_base_vijud_inicio_mes`
+* `vw_base_proposta_negocio`
+* `vw_base_meta_escritorio`
+* `vw_base_gate_comissionamento`
+
+## Silver-canônica
+
+Integração estrutural:
+
+* `tb_slv_can_pagamento_evento`
+* `tb_slv_can_carteira_evento`
+
+## Gold-semântica
+
+Conceitos estáveis:
+
+* `vw_sem_carteira_elegivel_pagamento`
+* `tb_gld_sem_pagamento_consolidado`
+* `tb_gld_sem_resultado_regul`
+
+## Gold-analítica
+
+Respostas prontas:
+
+* `tb_gld_anl_pagadoria_escritorio_mes`
+* `tb_gld_anl_comissionamento_escritorio_mes`
+* `tb_gld_anl_fluxo_mensal`
+
+## Semantic layer final
+
+Consumo BI:
+
+* `vw_qs_pagadoria_final`
+* dataset QuickSight de pagadoria
+
+---
+
+# 4. Regra de desempate: view ou tabela?
+
+## Use view quando
+
+* a lógica é estável
+* o custo é aceitável
+* você quer esconder complexidade
+* ainda está amadurecendo
+* não precisa persistir fisicamente
+
+## Use tabela quando
+
+* recalcular dói
+* muita gente consome
+* QuickSight depende
+* fechamento depende
+* comissão depende
+* é uma entidade “oficial”
+
+No Athena, essa distinção é bem objetiva:
+views não escrevem dados; CTAS cria nova tabela e grava os resultados em S3. 
+
+E, para operação recorrente, a própria documentação sugere o padrão:
+
+* CTAS para carga inicial
+* INSERT INTO para incrementais 
+
+---
+
+# 5. Heurística final, curtinha
+
+```text
+Não reutiliza?
+-> query
+
+Padroniza origem?
+-> base
+
+Integra fontes?
+-> canônica
+
+Cria conceito de negócio?
+-> semântica
+
+Entrega resposta pronta?
+-> analítica
+
+Só traduz para usuário final?
+-> semantic layer final
+```
+
+---
+
+# 6. Frase-mãe
+
+> **base organiza a origem, canônica organiza a estrutura, semântica organiza o significado, analítica organiza a resposta.**
+
+E para decidir entre view e tabela:
+
+> **reutilizado + leve = view**
+> **reutilizado + pesado = tabela**
+> **pontual = query**
+
+Se você quiser, no próximo passo eu transformo isso em uma **nota markdown já pronta para Obsidian**, com frontmatter, blocos de decisão e uma seção “exemplos do meu ambiente”.
+
