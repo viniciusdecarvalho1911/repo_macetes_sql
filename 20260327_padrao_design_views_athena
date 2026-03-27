@@ -1516,6 +1516,678 @@ porque o guia do Athena alerta para lookup caro de partições e para o uso disc
 ---
 
 ```
+--------------------
+
+Perfeito. Abaixo vai uma **query completa, comentada e didática**, pensada para servir ao mesmo tempo como:
+
+* **query de trabalho**
+* **material de estudo**
+* **exemplo de arquitetura SQL reaproveitável no Athena**
+
+A estrutura segue exatamente o padrão que consolidamos antes: **parâmetros → base principal → satélites → enriquecimento → regras → agregação → output** .
+Também respeita a ideia de evitar `JOIN` repetido, `CASE` gigante espalhado e lógica toda misturada, usando CTEs com função clara e lookup/de-para quando possível .
+E, do lado do Athena, a query foi escrita de forma a **preservar filtros em colunas físicas de partição**, já que o engine aplica partition pruning a partir do predicado de filtro .
+
+---
+
+# Query completa — pagamentos consolidados
+
+> Observação importante:
+> os nomes das views/tabelas abaixo são **exemplo estruturado**.
+> Você deve ajustar para os nomes reais do seu ambiente.
+
+```sql
+-- =====================================================================================
+-- QUERY: PAGAMENTOS CONSOLIDADOS COM META, GATE E COMISSIONAMENTO
+-- CONTEXTO:
+--   1) Parte da carteira vigor do mês
+--   2) Remove contratos que estão no colchão
+--   3) Remove contratos que estão no vijud no início do mês
+--   4) Busca pagamentos em 3 fontes:
+--        - boletos pagos
+--        - débito em conta
+--        - fluxo apartado / back office
+--   5) Deduplica pagamentos multi-origem
+--   6) Busca desconto:
+--        - primeiro no boleto
+--        - se não houver, na proposta de negócio
+--   7) Aplica regra financeira:
+--        - se for à vista => Caixa = valor pago
+--        - senão => Regul = saldo_gerencial - (saldo_gerencial * desconto)
+--   8) Agrega por escritório
+--   9) Confronta com meta
+--  10) Aplica gate / percentual de comissão
+--
+-- OBSERVAÇÕES DE DESIGN:
+--   - O bloco "parametros" centraliza datas e recortes
+--   - A base principal define o grão da análise
+--   - Os satélites trazem dados auxiliares
+--   - A lógica de negócio fica isolada do join e da agregação
+--   - O output final fica "bonito" para leitura
+--
+-- ATHENA / PERFORMANCE:
+--   - Sempre que possível, filtre usando a coluna física de partição
+--   - Evite CAST/SUBSTR na coluna particionada dentro do WHERE
+--   - Use EXPLAIN depois para validar pruning e custo
+-- =====================================================================================
+
+WITH
+
+-- =====================================================================================
+-- 1) PARÂMETROS
+-- -------------------------------------------------------------------------------------
+-- Este bloco concentra tudo que muda com frequência.
+-- A vantagem é que você troca o período uma vez só.
+-- Também deixa a query mais legível e reaproveitável.
+-- =====================================================================================
+parametros AS (
+    SELECT
+        202602 AS p_anomes,                  -- competência da carteira / meta
+        20260201 AS p_dt_inicio_mes,         -- início da janela de pagamentos
+        20260229 AS p_dt_fim_mes,            -- fim da janela de pagamentos
+        20260201 AS p_dt_vijud_inicio_mes    -- foto do vijud usada para exclusão
+),
+
+-- =====================================================================================
+-- 2) BASE PRINCIPAL: CARTEIRA VIGOR DO MÊS
+-- -------------------------------------------------------------------------------------
+-- Aqui declaramos o grão principal da análise.
+-- Neste exemplo:
+--   1 linha por contrato + produto dentro da carteira vigor da competência.
+--
+-- Importante:
+--   - usamos a coluna física de partição p_anomes no filtro
+--   - isso ajuda o Athena a aplicar pruning
+-- =====================================================================================
+carteira_vigor AS (
+    SELECT
+        v.p_anomes,
+        v.contrato,
+        v.produto,
+        v.cnpj_raiz,
+        v.escritorio,
+        v.fila,
+        v.cluster_rv,
+        v.atr_ctr,
+        v.vl_saldo_gerencial
+    FROM workspace_db.vw_base_carteira_vigor v
+    CROSS JOIN parametros p
+    WHERE v.p_anomes = p.p_anomes
+),
+
+-- =====================================================================================
+-- 3) SATÉLITE: CONTRATOS PRESENTES NO COLCHÃO
+-- -------------------------------------------------------------------------------------
+-- Vamos usar esta lista apenas para exclusão.
+-- DISTINCT ajuda a reduzir risco de multiplicação de linhas no join posterior.
+-- =====================================================================================
+colchao_mes AS (
+    SELECT DISTINCT
+        c.contrato,
+        c.produto
+    FROM workspace_db.vw_base_colchao c
+    CROSS JOIN parametros p
+    WHERE c.p_anomes = p.p_anomes
+),
+
+-- =====================================================================================
+-- 4) SATÉLITE: CONTRATOS PRESENTES NO VIJUD NO INÍCIO DO MÊS
+-- -------------------------------------------------------------------------------------
+-- Repare que aqui o recorte é diferente:
+-- usamos a foto do início do mês para decidir a exclusão.
+-- =====================================================================================
+vijud_inicio_mes AS (
+    SELECT DISTINCT
+        j.contrato,
+        j.produto
+    FROM workspace_db.vw_base_vijud_inicio_mes j
+    CROSS JOIN parametros p
+    WHERE j.p_dt_foto = p.p_dt_vijud_inicio_mes
+),
+
+-- =====================================================================================
+-- 5) CARTEIRA ELEGÍVEL
+-- -------------------------------------------------------------------------------------
+-- Regra:
+--   carteira vigor
+--   menos contratos que estão no colchão
+--   menos contratos que estão no vijud do início do mês
+--
+-- Técnica:
+--   LEFT JOIN + IS NULL
+-- Isso tende a ser mais auditável que NOT IN e lida melhor com nulls.
+-- =====================================================================================
+carteira_elegivel AS (
+    SELECT
+        v.*
+    FROM carteira_vigor v
+    LEFT JOIN colchao_mes c
+        ON v.contrato = c.contrato
+       AND v.produto  = c.produto
+    LEFT JOIN vijud_inicio_mes j
+        ON v.contrato = j.contrato
+       AND v.produto  = j.produto
+    WHERE c.contrato IS NULL
+      AND j.contrato IS NULL
+),
+
+-- =====================================================================================
+-- 6) SATÉLITE: BOLETOS PAGOS VÁLIDOS
+-- -------------------------------------------------------------------------------------
+-- Regra:
+--   - considera apenas a janela do mês
+--   - descarta boleto cancelado
+--
+-- Observação:
+--   dt_ref_yyyymmdd aqui representa a coluna canônica diária
+--   se a partição física real for outra (ex: p_dt_ref), prefira filtrar por ela
+-- =====================================================================================
+boletos_validos AS (
+    SELECT
+        b.contrato,
+        b.produto,
+        b.boleto,
+        b.dt_pagamento,
+        b.vl_pago,
+        b.vl_desconto_boleto,
+        'BOLETO' AS origem_pagamento
+    FROM workspace_db.vw_base_boletos_pagos b
+    CROSS JOIN parametros p
+    WHERE b.dt_ref_yyyymmdd BETWEEN p.p_dt_inicio_mes AND p.p_dt_fim_mes
+      AND COALESCE(b.flag_cancelado, 0) = 0
+),
+
+-- =====================================================================================
+-- 7) SATÉLITE: DÉBITO EM CONTA
+-- -------------------------------------------------------------------------------------
+-- Nesta fonte pode não existir boleto e pode não existir desconto do boleto.
+-- Por isso preenchemos alguns campos com NULL para padronizar o UNION ALL.
+-- =====================================================================================
+debito_conta AS (
+    SELECT
+        d.contrato,
+        d.produto,
+        CAST(NULL AS VARCHAR) AS boleto,
+        d.dt_pagamento,
+        d.vl_pago,
+        CAST(NULL AS DECIMAL(18,4)) AS vl_desconto_boleto,
+        'DEBITO_CONTA' AS origem_pagamento
+    FROM workspace_db.vw_base_debito_conta d
+    CROSS JOIN parametros p
+    WHERE d.dt_ref_yyyymmdd BETWEEN p.p_dt_inicio_mes AND p.p_dt_fim_mes
+),
+
+-- =====================================================================================
+-- 8) SATÉLITE: FLUXO APARTADO / BACK OFFICE
+-- -------------------------------------------------------------------------------------
+-- Mesma lógica: padronizamos o layout para facilitar a consolidação das fontes.
+-- =====================================================================================
+fluxo_apartado AS (
+    SELECT
+        f.contrato,
+        f.produto,
+        CAST(NULL AS VARCHAR) AS boleto,
+        f.dt_pagamento,
+        f.vl_pago,
+        CAST(NULL AS DECIMAL(18,4)) AS vl_desconto_boleto,
+        'BACKOFFICE' AS origem_pagamento
+    FROM workspace_db.vw_base_fluxo_apartado f
+    CROSS JOIN parametros p
+    WHERE f.dt_ref_yyyymmdd BETWEEN p.p_dt_inicio_mes AND p.p_dt_fim_mes
+),
+
+-- =====================================================================================
+-- 9) UNIÃO DAS FONTES DE PAGAMENTO
+-- -------------------------------------------------------------------------------------
+-- Aqui ainda não estamos deduplicando.
+-- Estamos apenas empilhando as fontes.
+-- UNION ALL é proposital: mais barato e mais correto nesta fase.
+-- =====================================================================================
+pagamentos_brutos AS (
+    SELECT * FROM boletos_validos
+    UNION ALL
+    SELECT * FROM debito_conta
+    UNION ALL
+    SELECT * FROM fluxo_apartado
+),
+
+-- =====================================================================================
+-- 10) DEDUPLICAÇÃO DE PAGAMENTOS
+-- -------------------------------------------------------------------------------------
+-- Este é um dos pontos mais importantes da query.
+--
+-- Problema:
+--   o mesmo pagamento pode aparecer em mais de uma origem.
+--
+-- Estratégia:
+--   usamos ROW_NUMBER para manter apenas 1 linha por chave de evento de pagamento.
+--
+-- Chave usada no exemplo:
+--   contrato + produto + dt_pagamento + vl_pago
+--
+-- IMPORTANTE:
+--   você deve revisar se essa é a melhor chave no seu ambiente.
+--   Às vezes será preciso incluir boleto, parcela, id_evento etc.
+--
+-- Precedência de origem:
+--   1) BOLETO
+--   2) DEBITO_CONTA
+--   3) BACKOFFICE
+-- =====================================================================================
+pagamentos_dedup AS (
+    SELECT
+        x.contrato,
+        x.produto,
+        x.boleto,
+        x.dt_pagamento,
+        x.vl_pago,
+        x.vl_desconto_boleto,
+        x.origem_pagamento
+    FROM (
+        SELECT
+            p.*,
+            ROW_NUMBER() OVER (
+                PARTITION BY
+                    p.contrato,
+                    p.produto,
+                    p.dt_pagamento,
+                    p.vl_pago
+                ORDER BY
+                    CASE p.origem_pagamento
+                        WHEN 'BOLETO' THEN 1
+                        WHEN 'DEBITO_CONTA' THEN 2
+                        WHEN 'BACKOFFICE' THEN 3
+                        ELSE 99
+                    END
+            ) AS rn
+        FROM pagamentos_brutos p
+    ) x
+    WHERE x.rn = 1
+),
+
+-- =====================================================================================
+-- 11) PAGAMENTOS ELEGÍVEIS
+-- -------------------------------------------------------------------------------------
+-- Agora confrontamos os pagamentos deduplicados com a carteira elegível.
+--
+-- Resultado:
+--   ficamos apenas com pagamentos que pertencem à carteira válida da competência.
+-- =====================================================================================
+pagamentos_elegiveis AS (
+    SELECT
+        c.p_anomes,
+        c.contrato,
+        c.produto,
+        c.cnpj_raiz,
+        c.escritorio,
+        c.fila,
+        c.cluster_rv,
+        c.atr_ctr,
+        c.vl_saldo_gerencial,
+        p.boleto,
+        p.dt_pagamento,
+        p.vl_pago,
+        p.vl_desconto_boleto,
+        p.origem_pagamento
+    FROM carteira_elegivel c
+    INNER JOIN pagamentos_dedup p
+        ON c.contrato = p.contrato
+       AND c.produto  = p.produto
+),
+
+-- =====================================================================================
+-- 12) SATÉLITE: PROPOSTA DE NEGÓCIO MAIS RECENTE
+-- -------------------------------------------------------------------------------------
+-- Ideia:
+--   se o desconto não vier da base de boletos,
+--   buscamos na proposta de negócio.
+--
+-- Regra do exemplo:
+--   pegamos a proposta mais recente por contrato/produto/boleto.
+--
+-- IMPORTANTE:
+--   se seu negócio exigir "proposta vigente na data do pagamento",
+--   o join temporal precisa ser refinado.
+-- =====================================================================================
+proposta_negocio_raw AS (
+    SELECT
+        pn.contrato,
+        pn.produto,
+        pn.boleto,
+        pn.tp_acordo,
+        pn.perc_desconto,
+        pn.dt_referencia,
+        ROW_NUMBER() OVER (
+            PARTITION BY
+                pn.contrato,
+                pn.produto,
+                COALESCE(pn.boleto, 'SEM_BOLETO')
+            ORDER BY pn.dt_referencia DESC
+        ) AS rn
+    FROM workspace_db.vw_base_proposta_negocio pn
+),
+
+proposta_negocio AS (
+    SELECT
+        contrato,
+        produto,
+        boleto,
+        tp_acordo,
+        perc_desconto
+    FROM proposta_negocio_raw
+    WHERE rn = 1
+),
+
+-- =====================================================================================
+-- 13) ENRIQUECIMENTO: CAPTURA DO DESCONTO FINAL
+-- -------------------------------------------------------------------------------------
+-- Regra:
+--   1) tenta desconto vindo do boleto
+--   2) se não houver, tenta proposta de negócio
+--   3) se nada existir, assume 0
+--
+-- Também trazemos o tipo de acordo para usar depois na regra Caixa x Regul.
+-- =====================================================================================
+pagamentos_com_desconto AS (
+    SELECT
+        p.p_anomes,
+        p.contrato,
+        p.produto,
+        p.cnpj_raiz,
+        p.escritorio,
+        p.fila,
+        p.cluster_rv,
+        p.atr_ctr,
+        p.vl_saldo_gerencial,
+        p.boleto,
+        p.dt_pagamento,
+        p.vl_pago,
+        p.origem_pagamento,
+        pr.tp_acordo,
+        COALESCE(
+            p.vl_desconto_boleto,
+            pr.perc_desconto,
+            0
+        ) AS perc_desconto_final
+    FROM pagamentos_elegiveis p
+    LEFT JOIN proposta_negocio pr
+        ON p.contrato = pr.contrato
+       AND p.produto  = pr.produto
+       AND COALESCE(p.boleto, 'SEM_BOLETO') = COALESCE(pr.boleto, 'SEM_BOLETO')
+),
+
+-- =====================================================================================
+-- 14) REGRAS FINANCEIRAS
+-- -------------------------------------------------------------------------------------
+-- Aqui isolamos a regra de negócio principal:
+--
+--   se for À VISTA:
+--       Caixa = valor pago
+--       Regul = 0
+--
+--   senão:
+--       Caixa = 0
+--       Regul = saldo_gerencial - (saldo_gerencial * desconto)
+--
+-- IMPORTANTE:
+--   esta regra precisa refletir exatamente o conceito do negócio.
+--   Se desconto vier em percentual de 25%, o valor deve estar como 0.25 e não 25.
+-- =====================================================================================
+regras_financeiras AS (
+    SELECT
+        p.*,
+
+        CASE
+            WHEN UPPER(COALESCE(p.tp_acordo, '')) IN ('AVISTA', 'A VISTA', 'A_VISTA')
+                THEN p.vl_pago
+            ELSE 0
+        END AS vl_caixa,
+
+        CASE
+            WHEN UPPER(COALESCE(p.tp_acordo, '')) IN ('AVISTA', 'A VISTA', 'A_VISTA')
+                THEN 0
+            ELSE p.vl_saldo_gerencial
+                 - (p.vl_saldo_gerencial * p.perc_desconto_final)
+        END AS vl_regul
+    FROM pagamentos_com_desconto p
+),
+
+-- =====================================================================================
+-- 15) AGREGAÇÃO POR ESCRITÓRIO
+-- -------------------------------------------------------------------------------------
+-- Neste ponto já estamos numa visão mensal por escritório.
+-- É aqui que o processo começa a ficar pronto para meta e comissão.
+-- =====================================================================================
+resultado_escritorio AS (
+    SELECT
+        p_anomes,
+        escritorio,
+        COUNT(DISTINCT contrato) AS qtd_contratos_pagantes,
+        SUM(vl_caixa) AS vl_caixa,
+        SUM(vl_regul) AS vl_regul
+    FROM regras_financeiras
+    GROUP BY 1,2
+),
+
+-- =====================================================================================
+-- 16) SATÉLITE: META DO ESCRITÓRIO
+-- -------------------------------------------------------------------------------------
+-- Meta no mesmo grão da apuração final:
+-- competência + escritório
+-- =====================================================================================
+meta_escritorio AS (
+    SELECT
+        m.p_anomes,
+        m.escritorio,
+        m.vl_meta_regul
+    FROM workspace_db.vw_base_meta_escritorio m
+    CROSS JOIN parametros p
+    WHERE m.p_anomes = p.p_anomes
+),
+
+-- =====================================================================================
+-- 17) CONFRONTO RESULTADO x META
+-- -------------------------------------------------------------------------------------
+-- Aqui calculamos o percentual de atingimento.
+-- Protegemos contra divisão por zero.
+-- =====================================================================================
+resultado_meta AS (
+    SELECT
+        r.p_anomes,
+        r.escritorio,
+        r.qtd_contratos_pagantes,
+        r.vl_caixa,
+        r.vl_regul,
+        m.vl_meta_regul,
+        CASE
+            WHEN COALESCE(m.vl_meta_regul, 0) > 0
+                THEN r.vl_regul / m.vl_meta_regul
+            ELSE NULL
+        END AS perc_atingimento
+    FROM resultado_escritorio r
+    LEFT JOIN meta_escritorio m
+        ON r.p_anomes   = m.p_anomes
+       AND r.escritorio = m.escritorio
+),
+
+-- =====================================================================================
+-- 18) SATÉLITE: TABELA DE GATE / COMISSIONAMENTO
+-- -------------------------------------------------------------------------------------
+-- Esta base deveria idealmente ser uma tabela de regra:
+--   escritório | faixa_ini | faixa_fim | gate | perc_comissao
+--
+-- Isso é melhor do que CASE gigante, porque:
+--   - é auditável
+--   - é versionável
+--   - pode ser ajustado sem reescrever a query inteira
+-- =====================================================================================
+gate_comissao AS (
+    SELECT
+        g.escritorio,
+        g.faixa_ini,
+        g.faixa_fim,
+        g.gate,
+        g.perc_comissao
+    FROM workspace_db.vw_base_gate_comissionamento g
+),
+
+-- =====================================================================================
+-- 19) ENRIQUECIMENTO FINAL COM GATE E COMISSÃO
+-- -------------------------------------------------------------------------------------
+-- Fazemos o lookup da faixa do gate pelo percentual de atingimento.
+--
+-- Atenção:
+--   as faixas da tabela de gate não podem se sobrepor,
+--   senão um escritório pode casar com mais de uma linha.
+-- =====================================================================================
+resultado_final AS (
+    SELECT
+        r.p_anomes,
+        r.escritorio,
+        r.qtd_contratos_pagantes,
+        r.vl_caixa,
+        r.vl_regul,
+        r.vl_meta_regul,
+        r.perc_atingimento,
+        g.gate,
+        g.perc_comissao,
+        r.vl_regul * g.perc_comissao AS vl_comissao
+    FROM resultado_meta r
+    LEFT JOIN gate_comissao g
+        ON r.escritorio = g.escritorio
+       AND r.perc_atingimento >= g.faixa_ini
+       AND r.perc_atingimento <  g.faixa_fim
+)
+
+-- =====================================================================================
+-- 20) OUTPUT FINAL
+-- -------------------------------------------------------------------------------------
+-- A parte final deve ser simples e "bonita".
+-- Toda a complexidade ficou para trás.
+-- =====================================================================================
+SELECT
+    p_anomes,
+    escritorio,
+    qtd_contratos_pagantes,
+    vl_caixa,
+    vl_regul,
+    vl_meta_regul,
+    perc_atingimento,
+    gate,
+    perc_comissao,
+    vl_comissao
+FROM resultado_final
+ORDER BY
+    p_anomes,
+    escritorio;
+```
+
+---
+
+# Como estudar essa query
+
+## 1. Leia por blocos, não por linha
+
+O padrão que você trouxe no texto colado está muito certo nisso: cada bloco deve ter uma função clara — parâmetros, base, satélites, enriquecimento, regra, agregação, output .
+
+## 2. Pergunte “qual é o grão?” em cada CTE
+
+Exemplo:
+
+* `carteira_vigor` → contrato/produto/mês
+* `pagamentos_brutos` → evento de pagamento
+* `resultado_escritorio` → escritório/mês
+
+Se o grão mudar sem você perceber, nasce duplicidade.
+
+## 3. Identifique os pontos de maior risco
+
+Nesta query, os pontos mais sensíveis são:
+
+* deduplicação de pagamentos
+* casamento com proposta de negócio
+* interpretação de “à vista”
+* tabela de gate sem sobreposição
+
+## 4. Use essa query como modelo
+
+Ela está no estilo “framework SQL Athena” que você queria:
+
+* parâmetros isolados
+* lógica modular
+* output limpo
+* pronta para evoluir para view ou gold table
+
+---
+
+# Como eu evoluiria isso em produção
+
+## Viraria view
+
+Coisas estáveis e repetidas:
+
+* `vw_sem_carteira_elegivel_pagamento`
+* `vw_sem_pagamentos_multiorigem`
+* `vw_sem_pagamentos_com_desconto`
+
+Isso segue a ideia do teu material: se o join aparece muitas vezes, ele já deveria estar isolado numa camada reutilizável .
+
+## Viraria tabela gold
+
+Se essa apuração for recorrente, eu materializaria:
+
+* `tb_gold_pagamentos_consolidados`
+
+O Athena recomenda usar `CTAS` para a carga inicial e `INSERT INTO` para incrementais em cenários ETL .
+
+---
+
+# Como validar depois no Athena
+
+Eu faria, nessa ordem:
+
+```sql
+EXPLAIN
+<query>
+```
+
+Depois validaria:
+
+* se as tabelas grandes estão sendo filtradas cedo
+* se a partição foi realmente aproveitada
+* se não surgiu join explosivo
+
+O plano do Athena explicita operações como `TableScan`, `ScanFilter` e `ScanFilterProject`, inclusive com pruning derivado dos predicados .
+
+---
+
+# Ajustes que você provavelmente vai querer fazer
+
+Você pode adaptar facilmente estes pontos:
+
+* nomes reais das views
+* janela de datas no bloco `parametros`
+* chave de deduplicação
+* regra de desconto
+* definição de “à vista”
+* nível do gate:
+
+  * por escritório
+  * por fila
+  * por cluster
+  * por escritório + fila
+
+---
+
+# Leitura final
+
+Essa query é um bom exemplo de três ideias que amarramos na conversa:
+
+1. **SQL reaproveitável**: separar parâmetros, base, satélites, regra e agregação
+2. **Athena bem usado**: preservar filtros simples para pruning e pensar em evolução para CTAS/INSERT INTO quando virar ETL recorrente
+3. **Arquitetura de dados**: esconder complexidade estável em views e materializar quando performance e consumo pedirem isso; Adamson inclusive comenta o papel de views para esconder complexidade de joins auxiliares e o valor de agregados para acelerar consumo recorrente
+
+No próximo passo, eu posso te devolver uma **versão 2 com nomes próximos do seu ambiente real**, já no padrão `workspace_db.*`, e também uma **versão CTAS** para gravar isso como `tb_gold_pagamentos_consolidados`.
 
 Se você quiser, no próximo passo eu monto uma **versão 2 já preenchida com nomes do seu domínio** — por exemplo `vw_base_carteira_vigor`, `vw_sem_pagamento_conciliado` e `vw_anl_pagadoria_base` com SQL mais próximo do seu ambiente.
 ```
