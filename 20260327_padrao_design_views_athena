@@ -1,0 +1,1521 @@
+Perfeito. Vou te devolver as duas coisas de forma integrada:
+
+1. **guia de design de views para Athena**
+2. **padrão oficial de colunas temporais e de partição para seu lakehouse**
+
+Vou montar isso pensando no seu cenário real: Athena + Glue + S3 + cobrança + mistura de Hive e Iceberg.
+
+---
+
+# 1. Guia de design de views para Athena
+
+## Objetivo
+
+Usar views para reaproveitar lógica sem:
+
+* destruir partition pruning
+* esconder colunas físicas importantes
+* criar SQL bonito para humano e ruim para motor
+
+Isso é especialmente relevante no Athena porque pruning e pushdown dependem muito de como o predicado aparece na consulta. A documentação também reforça que, para partições em grande volume, o desenho da chave de partição e dos filtros faz diferença direta na performance.  
+
+---
+
+## Princípio central
+
+Cada view deve servir a **uma função arquitetural clara**:
+
+* `vw_base_*` → padronização e exposição segura da estrutura física
+* `vw_sem_*` → semântica e regra de negócio
+* `vw_anl_*` → consumo analítico recorrente
+* `tb_gold_*` → materialização quando a view ficar pesada demais
+
+O seu próprio material já estava indo nessa direção ao separar parâmetros, base, satélites, enriquecimento, regras e agregação, e ao tratar view como camada semântica reutilizável.  
+
+---
+
+## Regra de ouro de view no Athena
+
+> **View boa preserva a física e melhora a leitura.
+> View ruim mascara a física e obriga o motor a adivinhar.**
+
+---
+
+## Camada 1 — `vw_base_*`
+
+### Papel
+
+Expor a tabela de forma segura e padronizada, sem esconder:
+
+* coluna de partição física
+* chaves de join
+* colunas de auditoria
+* grão
+
+### O que pode fazer
+
+* renomear colunas
+* normalizar tipos auxiliares
+* criar colunas canônicas derivadas
+* deduplicar, se isso fizer parte do contrato da base
+
+### O que não deve fazer
+
+* agregar cedo demais
+* remover a coluna física de partição
+* forçar filtro temporal “bonito” no lugar do filtro físico
+
+### Exemplo
+
+```sql
+CREATE OR REPLACE VIEW workspace_db.vw_base_carteira_vigor AS
+SELECT
+    anomes                                  AS p_anomes,
+    dt_foto                                 AS p_dt_foto,
+    cast(anomes as integer)                 AS mes_ref_yyyymm,
+    cast(dt_foto as integer)                AS dt_ref_yyyymmdd,
+    contrato,
+    produto,
+    cnpj_raiz,
+    escritorio,
+    fila,
+    cluster_rv,
+    atr_ctr,
+    vl_ser,
+    vl_saldo
+FROM workspace_db.raw_carteira_vigor;
+```
+
+### Leitura arquitetural
+
+Aqui você criou duas camadas ao mesmo tempo:
+
+* física: `p_anomes`, `p_dt_foto`
+* semântica básica/canônica: `mes_ref_yyyymm`, `dt_ref_yyyymmdd`
+
+Mas a física continua viva.
+
+---
+
+## Camada 2 — `vw_sem_*`
+
+### Papel
+
+Aplicar semântica de negócio e enriquecer com joins recorrentes.
+
+### Pode fazer
+
+* joins repetidos
+* de/para
+* flags
+* classificação de status
+* consolidação de fontes
+
+### Não deve fazer
+
+* esconder a coluna física herdada da base
+* exigir que o usuário filtre em coluna derivada quando a física é a que faz pruning
+* embutir janela temporal variável e arbitrária
+
+### Exemplo
+
+```sql
+CREATE OR REPLACE VIEW workspace_db.vw_sem_contrato_status AS
+SELECT
+    b.p_anomes,
+    b.p_dt_foto,
+    b.mes_ref_yyyymm,
+    b.dt_ref_yyyymmdd,
+    b.contrato,
+    b.produto,
+    b.cnpj_raiz,
+    b.escritorio,
+    b.fila,
+    b.cluster_rv,
+    b.atr_ctr,
+    b.vl_ser,
+    b.vl_saldo,
+    CASE
+        WHEN c.flag_colchao = 1 THEN 'COLCHAO'
+        WHEN v.flag_vijud = 1 THEN 'VIJUD'
+        ELSE 'VIGOR'
+    END AS tp_carteira,
+    CASE
+        WHEN b.atr_ctr >= 360 THEN '360+'
+        WHEN b.atr_ctr >= 180 THEN '180-359'
+        WHEN b.atr_ctr >= 90  THEN '90-179'
+        WHEN b.atr_ctr >= 60  THEN '60-89'
+        ELSE '0-59'
+    END AS faixa_atraso
+FROM workspace_db.vw_base_carteira_vigor b
+LEFT JOIN workspace_db.vw_base_flags_colchao c
+  ON b.contrato = c.contrato
+ AND b.produto  = c.produto
+LEFT JOIN workspace_db.vw_base_flags_vijud v
+  ON b.contrato = v.contrato
+ AND b.produto  = v.produto;
+```
+
+### Ponto importante
+
+A view semântica herdou `p_anomes` e `p_dt_foto`.
+
+Isso é o que impede você de criar uma camada bonita, mas cega para pruning.
+
+---
+
+## Camada 3 — `vw_anl_*`
+
+### Papel
+
+Responder perguntas recorrentes de negócio.
+
+### Pode fazer
+
+* agregações frequentes
+* métricas
+* agrupamentos
+* consumo QuickSight
+
+### Não deve fazer
+
+* tentar ser universal
+* esconder demais a granularidade
+* virar substituta da camada base e da camada semântica
+
+### Exemplo
+
+```sql
+CREATE OR REPLACE VIEW workspace_db.vw_anl_estoque_mes_escritorio AS
+SELECT
+    mes_ref_yyyymm,
+    escritorio,
+    tp_carteira,
+    faixa_atraso,
+    count(*)                      AS qtd_registros,
+    count(distinct contrato)      AS qtd_contratos,
+    sum(vl_saldo)                 AS vl_saldo,
+    sum(vl_ser)                   AS vl_ser
+FROM workspace_db.vw_sem_contrato_status
+GROUP BY 1,2,3,4;
+```
+
+### Quando usar
+
+Quando isso é realmente consumido toda hora.
+
+### Quando não usar
+
+Se cada análise muda completamente os agrupamentos.
+
+---
+
+## Quando sair de view e virar tabela
+
+Views no Athena não materializam resultado. Então, se a lógica é pesada e recorrente, o caminho maduro é:
+
+* `vw_*` para semântica
+* `tb_gold_*` para performance
+
+Isso encaixa bem com Athena + Step Functions, já que o Step Functions integra nativamente com `StartQueryExecution` para orquestrar queries.
+
+### Exemplo mental
+
+* `vw_sem_pagamento_conciliado` = regra
+* `tb_gold_pagamento_conciliado_mes` = resultado persistido
+
+---
+
+# 2. Padrão oficial de colunas temporais e de partição
+
+Agora a parte mais importante.
+
+Seu problema real não é só view.
+É a coexistência de formatos diferentes:
+
+* `anomes` bigint `202602`
+* `dt_foto` int `20260201`
+* `dt_ref` string `'2026-02-01'`
+* `event_time` timestamp
+* Hive em umas tabelas
+* Iceberg em outras
+
+A solução forte é:
+
+> **sempre separar coluna física de partição da coluna canônica de negócio.**
+
+---
+
+## Convenção oficial recomendada
+
+### Prefixos
+
+#### `p_*`
+
+Coluna física de partição, usada para pruning.
+
+Exemplos:
+
+* `p_anomes`
+* `p_dt_foto`
+* `p_dt_ref`
+* `p_event_date`
+
+#### colunas canônicas
+
+Usadas para join, regra, leitura e padronização cross-source.
+
+Exemplos:
+
+* `mes_ref_yyyymm`
+* `dt_ref_yyyymmdd`
+* `dt_ref_date`
+* `ts_ref`
+
+---
+
+## Tabela de padrão
+
+### Mensal
+
+* `p_anomes` → partição física mensal
+* `mes_ref_yyyymm` → mês canônico inteiro
+* `mes_ref_date` → primeiro dia do mês, quando fizer sentido
+
+### Diário
+
+* `p_dt_foto` ou `p_dt_ref` → partição física diária
+* `dt_ref_yyyymmdd` → data canônica inteira
+* `dt_ref_date` → data amigável
+
+### Timestamp
+
+* `event_time` ou `ts_ref` → coluna temporal real de negócio
+* `p_event_date` → partição física diária em Hive, quando existir
+
+---
+
+# 3. Regras por tipo de origem
+
+## Caso A — tabela com `anomes bigint`
+
+### View base
+
+```sql
+CREATE OR REPLACE VIEW workspace_db.vw_base_carteira_mes AS
+SELECT
+    anomes                                      AS p_anomes,
+    cast(anomes as integer)                     AS mes_ref_yyyymm,
+    cast(concat(cast(anomes as varchar), '01') as integer) AS dt_ref_yyyymmdd,
+    contrato,
+    produto,
+    cnpj_raiz,
+    escritorio,
+    vl_saldo
+FROM workspace_db.carteira_mes;
+```
+
+### Como consultar
+
+Para pruning:
+
+```sql
+SELECT *
+FROM workspace_db.vw_base_carteira_mes
+WHERE p_anomes = 202602;
+```
+
+Para join ou regra:
+use `mes_ref_yyyymm`.
+
+---
+
+## Caso B — tabela com `dt_foto int` no formato `YYYYMMDD`
+
+### View base
+
+```sql
+CREATE OR REPLACE VIEW workspace_db.vw_base_snapshot_diario AS
+SELECT
+    dt_foto                                     AS p_dt_foto,
+    cast(substr(cast(dt_foto as varchar), 1, 6) as integer) AS mes_ref_yyyymm,
+    dt_foto                                     AS dt_ref_yyyymmdd,
+    contrato,
+    produto,
+    escritorio,
+    vl_saldo
+FROM workspace_db.snapshot_diario;
+```
+
+### Como consultar
+
+Para pruning:
+
+```sql
+SELECT *
+FROM workspace_db.vw_base_snapshot_diario
+WHERE p_dt_foto BETWEEN 20260201 AND 20260229;
+```
+
+Não use `substr(cast(p_dt_foto as varchar),1,6)` no `WHERE`.
+
+---
+
+## Caso C — tabela com `dt_ref string` no formato `YYYY-MM-DD`
+
+A documentação do Athena recomenda usar `STRING` como tipo da chave de partição para empurrar o filtro de partição para o Glue. Se o número de partições não for pequeno, outros tipos podem piorar a performance. 
+
+### View base
+
+```sql
+CREATE OR REPLACE VIEW workspace_db.vw_base_pagamentos_dia AS
+SELECT
+    dt_ref                                              AS p_dt_ref,
+    cast(replace(substr(dt_ref, 1, 7), '-', '') as integer) AS mes_ref_yyyymm,
+    cast(replace(dt_ref, '-', '') as integer)           AS dt_ref_yyyymmdd,
+    cast(dt_ref as date)                                AS dt_ref_date,
+    contrato,
+    produto,
+    boleto,
+    vl_pago
+FROM workspace_db.pagamentos_dia;
+```
+
+### Como consultar
+
+Para pruning:
+
+```sql
+SELECT *
+FROM workspace_db.vw_base_pagamentos_dia
+WHERE p_dt_ref BETWEEN '2026-02-01' AND '2026-02-29';
+```
+
+Para regra/join:
+use `mes_ref_yyyymm` ou `dt_ref_date`.
+
+---
+
+## Caso D — Hive com timestamp + partição derivada separada
+
+Na documentação do Athena, para tabelas Hive, o engine não conhece automaticamente a relação entre a coluna de timestamp e a chave de partição. Por isso, você deve filtrar a coluna temporal e também a partição. 
+
+### View base
+
+```sql
+CREATE OR REPLACE VIEW workspace_db.vw_base_eventos_hive AS
+SELECT
+    event_date                      AS p_event_date,
+    event_time                      AS ts_ref,
+    cast(event_time as date)        AS dt_ref_date,
+    cast(date_format(event_time, '%Y%m') as integer) AS mes_ref_yyyymm,
+    contrato,
+    produto,
+    evento,
+    valor
+FROM workspace_db.eventos_hive;
+```
+
+### Como consultar corretamente
+
+```sql
+SELECT *
+FROM workspace_db.vw_base_eventos_hive
+WHERE ts_ref >= TIMESTAMP '2026-02-01 00:00:00'
+  AND ts_ref <  TIMESTAMP '2026-02-02 00:00:00'
+  AND p_event_date = '2026-02-01';
+```
+
+Essa é uma das regras mais importantes do guia.
+
+---
+
+## Caso E — Iceberg com hidden partitioning
+
+No Athena, com Iceberg, o engine pode podar partições automaticamente a partir do predicado sobre o timestamp; a documentação mostra esse comportamento com partição derivada de `event_time`. Para melhor pushdown, o range ideal é de dia cheio, como `00:00:00` até `00:00:00` do dia seguinte. 
+
+### View base
+
+```sql
+CREATE OR REPLACE VIEW workspace_db.vw_base_eventos_iceberg AS
+SELECT
+    event_time                      AS ts_ref,
+    cast(event_time as date)        AS dt_ref_date,
+    cast(date_format(event_time, '%Y%m') as integer) AS mes_ref_yyyymm,
+    contrato,
+    produto,
+    evento,
+    valor
+FROM workspace_db.eventos_iceberg;
+```
+
+### Como consultar corretamente
+
+```sql
+SELECT *
+FROM workspace_db.vw_base_eventos_iceberg
+WHERE ts_ref >= TIMESTAMP '2026-02-01 00:00:00'
+  AND ts_ref <  TIMESTAMP '2026-02-02 00:00:00';
+```
+
+### Evite
+
+```sql
+WHERE ts_ref >= TIMESTAMP '2026-02-01 08:15:00'
+  AND ts_ref <  TIMESTAMP '2026-02-01 12:40:00'
+```
+
+Esse formato pode impedir o melhor pushdown em partições derivadas por data. 
+
+---
+
+# 4. Anti-patterns e substitutos
+
+## Anti-pattern 1
+
+Filtrar coluna derivada em vez da partição física.
+
+### Ruim
+
+```sql
+WHERE mes_ref_yyyymm = 202602
+```
+
+quando a partição física é `p_dt_ref`.
+
+### Melhor
+
+```sql
+WHERE p_dt_ref BETWEEN '2026-02-01' AND '2026-02-29'
+```
+
+e use `mes_ref_yyyymm` para agrupamento, join e regra.
+
+---
+
+## Anti-pattern 2
+
+Transformar a partição no `WHERE`.
+
+### Ruim
+
+```sql
+WHERE substr(cast(p_dt_foto as varchar), 1, 6) = '202602'
+```
+
+### Melhor
+
+```sql
+WHERE p_dt_foto BETWEEN 20260201 AND 20260229
+```
+
+---
+
+## Anti-pattern 3
+
+View semântica bonita demais e física apagada.
+
+### Ruim
+
+```sql
+CREATE VIEW vw_x AS
+SELECT
+    cast(p_dt_ref as date) as dt_ref_date,
+    date_trunc('month', cast(p_dt_ref as date)) as mes_ref,
+    ...
+FROM tabela;
+```
+
+### Melhor
+
+```sql
+CREATE VIEW vw_x AS
+SELECT
+    p_dt_ref,
+    cast(p_dt_ref as date) as dt_ref_date,
+    cast(replace(substr(p_dt_ref,1,7),'-','') as integer) as mes_ref_yyyymm,
+    ...
+FROM tabela;
+```
+
+---
+
+## Anti-pattern 4
+
+Agregação cedo demais.
+
+### Ruim
+
+```sql
+CREATE VIEW vw_fluxo AS
+SELECT escritorio, sum(vl_pago) as vl_pago
+FROM pagamentos
+GROUP BY 1;
+```
+
+Depois não há mais como filtrar corretamente por partição.
+
+### Melhor
+
+Preserve a granularidade na base/semântica e agregue na analítica.
+
+---
+
+# 5. Contrato oficial de colunas
+
+Aqui está um padrão que eu realmente adotaria no seu lakehouse.
+
+## Para qualquer `vw_base_*`
+
+Sempre tentar expor:
+
+* `p_*` → partição física
+* `mes_ref_yyyymm` → mês canônico
+* `dt_ref_yyyymmdd` → dia canônico, quando aplicável
+* `dt_ref_date` → data amigável, quando aplicável
+* `ts_ref` → timestamp de negócio, quando aplicável
+* chaves naturais
+* colunas cruas de negócio
+
+---
+
+## Exemplo de contrato
+
+### `vw_base_pagadoria`
+
+```sql
+CREATE OR REPLACE VIEW workspace_db.vw_base_pagadoria AS
+SELECT
+    anomes                                        AS p_anomes,
+    cast(anomes as integer)                       AS mes_ref_yyyymm,
+    dt_pagamento_ref                              AS p_dt_ref,
+    cast(replace(dt_pagamento_ref, '-', '') as integer) AS dt_ref_yyyymmdd,
+    cast(dt_pagamento_ref as date)                AS dt_ref_date,
+    contrato,
+    produto,
+    pasta,
+    boleto,
+    escritorio,
+    vl_pago,
+    origem_pagamento
+FROM workspace_db.pagadoria_raw;
+```
+
+---
+
+# 6. Como isso conversa com o seu modelo de cobrança
+
+No seu contexto, eu dividiria assim:
+
+## Base
+
+* `vw_base_carteira_vigor`
+* `vw_base_colchao`
+* `vw_base_vijud`
+* `vw_base_boletos`
+* `vw_base_pagamentos`
+* `vw_base_opc_baixas`
+
+## Semântica
+
+* `vw_sem_contrato_status`
+* `vw_sem_pagamento_conciliado`
+* `vw_sem_cliente_carteira_atual`
+* `vw_sem_faixa_atraso`
+
+## Analítica
+
+* `vw_anl_estoque_mes`
+* `vw_anl_fluxo_mensal`
+* `vw_anl_quebra_acordo`
+* `vw_anl_pagadoria_base`
+
+E em todas as bases, o contrato temporal seria o mesmo:
+
+* coluna física `p_*`
+* coluna canônica `mes_ref_yyyymm`
+* coluna diária `dt_ref_yyyymmdd` quando fizer sentido
+
+---
+
+# 7. Quando materializar
+
+Se a view semântica ficar:
+
+* pesada
+* muito consumida
+* base de QuickSight
+* parte de pipeline recorrente
+
+a saída mais robusta é materializar em Iceberg. O Glue documenta que Iceberg permite evoluir schema e partição após a criação, e o Athena/Glue trabalham bem com essa camada quando você quer leitura e escrita sustentáveis.
+
+---
+
+# 8. Checklist operacional
+
+Antes de publicar uma view, eu validaria:
+
+1. ela expõe a partição física?
+2. ela expõe uma coluna canônica de data/mês?
+3. o `WHERE` de consumo pode usar a coluna física?
+4. a semântica está centralizada e não duplicada?
+5. a view preserva o grão?
+6. se Hive, o padrão de consulta filtra também a partição?
+7. se Iceberg, o range de timestamp está em dia cheio?
+8. se muito pesada, já deveria virar `tb_gold_*`?
+
+---
+
+# 9. Resumo executivo
+
+## Guia de design de views
+
+* `vw_base_*` preserva física e padroniza interface
+* `vw_sem_*` concentra regra de negócio e joins recorrentes
+* `vw_anl_*` responde perguntas recorrentes
+* `tb_gold_*` materializa quando performance exigir
+
+## Padrão oficial de colunas
+
+* `p_*` = partição física
+* `mes_ref_yyyymm` = mês canônico
+* `dt_ref_yyyymmdd` = dia canônico
+* `dt_ref_date` = data amigável
+* `ts_ref` = timestamp de negócio
+
+## Regra mais importante
+
+> **Use a coluna física para pruning.
+> Use a coluna canônica para modelagem.**
+
+---
+
+Se você quiser, no próximo passo eu posso transformar isso em um **padrão institucional em markdown para Obsidian**, com:
+
+* convenção de nomes
+* exemplos SQL
+* checklist de publicação
+* matriz Hive vs Iceberg
+* template pronto de `vw_base`, `vw_sem` e `vw_anl`.
+
+
+-------------
+
+
+Segue em formato **markdown pronto para Obsidian**.
+
+````markdown
+---
+title: Padrão Institucional — Views, Partições e Colunas Temporais no Athena
+tags:
+  - athena
+  - aws
+  - glue
+  - iceberg
+  - hive
+  - sql
+  - arquitetura
+  - lakehouse
+  - cobranca
+status: draft
+owner: vinicius
+tipo: padrao-arquitetural
+---
+
+# Padrão Institucional — Views, Partições e Colunas Temporais no Athena
+
+## Objetivo
+
+Definir um padrão único para:
+
+- design de views no Athena
+- uso correto de colunas temporais
+- preservação de partition pruning
+- convivência entre Hive e Iceberg
+- padronização de `anomes`, `dt_foto`, `dt_ref` e `timestamp`
+
+Este padrão existe para evitar:
+
+- `cast`, `substr`, `date_parse` e afins no `WHERE`
+- perda de partition pruning
+- views “bonitas” para humano e ruins para o motor
+- repetição de joins e regras em várias queries
+- inconsistência entre análises
+
+A motivação é diretamente alinhada com o material-base de SQL reaproveitável: separar base, enriquecimento, regra e agregação, e transformar joins recorrentes e lógica repetida em estrutura reutilizável. :contentReference[oaicite:0]{index=0} :contentReference[oaicite:1]{index=1}
+
+---
+
+# 1. Princípios arquiteturais
+
+## 1.1 Regra principal
+
+> **Use a coluna física para pruning.  
+> Use a coluna canônica para modelagem, join, regra e leitura.**
+
+---
+
+## 1.2 Regra de views
+
+Cada view deve ter uma função clara:
+
+- `vw_base_*` → padronização e exposição da física
+- `vw_sem_*` → semântica e regra de negócio
+- `vw_anl_*` → consumo analítico recorrente
+- `tb_gold_*` → materialização quando a view ficar pesada
+
+---
+
+## 1.3 Regra de reaproveitamento
+
+Se o mesmo join ou a mesma lógica aparece em várias queries, isso não é “coincidência”.
+
+Isso é um sinal de que a lógica deveria estar isolada como camada semântica ou base reutilizável, exatamente no espírito do material de SQL reaproveitável. :contentReference[oaicite:2]{index=2} :contentReference[oaicite:3]{index=3}
+
+---
+
+# 2. Princípios técnicos de Athena
+
+## 2.1 Partição e performance
+
+No Athena, partições servem para reduzir leitura e custo. O próprio guia reforça que partições restringem a quantidade de dados escaneados e melhoram performance. :contentReference[oaicite:4]{index=4}
+
+Além disso, o Athena recomenda usar `STRING` como tipo de chave de partição para que o filtro de partição seja empurrado corretamente para o Glue; com muitas partições, usar outro tipo pode piorar a performance. :contentReference[oaicite:5]{index=5}
+
+---
+
+## 2.2 Partition projection
+
+Partition projection pode melhorar performance em tabelas com muitas partições, porque o Athena calcula as partições em memória em vez de depender de lookup no Glue Catalog. Mas, se a tabela for esparsa ou se faltar predicado em alguma chave de partição, isso pode piorar a execução e gerar muitas listagens no S3. :contentReference[oaicite:6]{index=6}
+
+---
+
+## 2.3 Iceberg e timestamp
+
+No Iceberg, o Athena pode podar partições automaticamente a partir do predicado sobre `event_time`. Para hidden partitioning baseada em timestamp, o guia recomenda filtros em **faixa de dia inteiro** para habilitar melhor predicate pushdown. :contentReference[oaicite:7]{index=7}
+
+---
+
+## 2.4 Step Functions + Athena
+
+Se uma view ou regra ficar pesada e recorrente, o caminho maduro é materializar isso em tabela. Step Functions integra nativamente com Athena por meio de `StartQueryExecution`, `StopQueryExecution`, `GetQueryExecution` e `GetQueryResults`, inclusive com padrão `.sync`. :contentReference[oaicite:8]{index=8} :contentReference[oaicite:9]{index=9}
+
+---
+
+# 3. Convenção oficial de nomenclatura temporal
+
+## 3.1 Colunas físicas de partição
+
+Prefixo obrigatório:
+
+- `p_*`
+
+Exemplos:
+
+- `p_anomes`
+- `p_dt_foto`
+- `p_dt_ref`
+- `p_event_date`
+
+Essas colunas existem para:
+
+- pruning
+- leitura física
+- debug de performance
+- alinhamento com o layout real da tabela
+
+---
+
+## 3.2 Colunas canônicas
+
+Essas colunas existem para:
+
+- joins cross-source
+- semântica
+- regra de negócio
+- agregação
+- consumo em BI
+
+Padrão:
+
+- `mes_ref_yyyymm`
+- `dt_ref_yyyymmdd`
+- `dt_ref_date`
+- `ts_ref`
+
+---
+
+## 3.3 Regra de convivência
+
+A mesma view base pode ter:
+
+- uma coluna física para o motor
+- uma coluna canônica para o modelo
+
+Exemplo:
+
+- `p_dt_ref = '2026-02-15'`
+- `mes_ref_yyyymm = 202602`
+- `dt_ref_yyyymmdd = 20260215`
+- `dt_ref_date = DATE '2026-02-15'`
+
+---
+
+# 4. Contrato oficial por tipo temporal
+
+## 4.1 Caso mensal — `anomes`
+
+### Quando usar
+Tabelas com foto ou competência mensal.
+
+### Colunas padrão
+- `p_anomes`
+- `mes_ref_yyyymm`
+- opcionalmente `dt_ref_yyyymmdd`
+
+### Exemplo
+```sql
+CREATE OR REPLACE VIEW workspace_db.vw_base_carteira_mes AS
+SELECT
+    anomes AS p_anomes,
+    cast(anomes as integer) AS mes_ref_yyyymm,
+    cast(concat(cast(anomes as varchar), '01') as integer) AS dt_ref_yyyymmdd,
+    contrato,
+    produto,
+    cnpj_raiz,
+    escritorio,
+    vl_saldo
+FROM workspace_db.carteira_mes;
+````
+
+### Filtro correto
+
+```sql
+WHERE p_anomes = 202602
+```
+
+---
+
+## 4.2 Caso diário inteiro — `dt_foto` em `YYYYMMDD`
+
+### Colunas padrão
+
+* `p_dt_foto`
+* `mes_ref_yyyymm`
+* `dt_ref_yyyymmdd`
+
+### Exemplo
+
+```sql
+CREATE OR REPLACE VIEW workspace_db.vw_base_snapshot_diario AS
+SELECT
+    dt_foto AS p_dt_foto,
+    cast(substr(cast(dt_foto as varchar), 1, 6) as integer) AS mes_ref_yyyymm,
+    dt_foto AS dt_ref_yyyymmdd,
+    contrato,
+    produto,
+    escritorio,
+    vl_saldo
+FROM workspace_db.snapshot_diario;
+```
+
+### Filtro correto
+
+```sql
+WHERE p_dt_foto BETWEEN 20260201 AND 20260229
+```
+
+---
+
+## 4.3 Caso diário string — `dt_ref` em `YYYY-MM-DD`
+
+### Colunas padrão
+
+* `p_dt_ref`
+* `mes_ref_yyyymm`
+* `dt_ref_yyyymmdd`
+* `dt_ref_date`
+
+### Exemplo
+
+```sql
+CREATE OR REPLACE VIEW workspace_db.vw_base_pagamentos_dia AS
+SELECT
+    dt_ref AS p_dt_ref,
+    cast(replace(substr(dt_ref, 1, 7), '-', '') as integer) AS mes_ref_yyyymm,
+    cast(replace(dt_ref, '-', '') as integer) AS dt_ref_yyyymmdd,
+    cast(dt_ref as date) AS dt_ref_date,
+    contrato,
+    produto,
+    boleto,
+    vl_pago
+FROM workspace_db.pagamentos_dia;
+```
+
+### Filtro correto
+
+```sql
+WHERE p_dt_ref BETWEEN '2026-02-01' AND '2026-02-28'
+```
+
+---
+
+## 4.4 Caso timestamp + Hive
+
+No Hive, quando a partição física está separada do timestamp de negócio, o filtro deve respeitar os dois mundos:
+
+* timestamp para semântica de tempo
+* partição para pruning
+
+### Colunas padrão
+
+* `p_event_date`
+* `ts_ref`
+* `dt_ref_date`
+* `mes_ref_yyyymm`
+
+### Exemplo
+
+```sql
+CREATE OR REPLACE VIEW workspace_db.vw_base_eventos_hive AS
+SELECT
+    event_date AS p_event_date,
+    event_time AS ts_ref,
+    cast(event_time as date) AS dt_ref_date,
+    cast(date_format(event_time, '%Y%m') as integer) AS mes_ref_yyyymm,
+    contrato,
+    produto,
+    evento,
+    valor
+FROM workspace_db.eventos_hive;
+```
+
+### Filtro correto
+
+```sql
+WHERE ts_ref >= TIMESTAMP '2026-02-01 00:00:00'
+  AND ts_ref <  TIMESTAMP '2026-02-02 00:00:00'
+  AND p_event_date = '2026-02-01'
+```
+
+---
+
+## 4.5 Caso timestamp + Iceberg
+
+No Iceberg com hidden partitioning derivada de timestamp, o engine pode fazer pruning com base em `event_time`. O melhor formato é usar faixas completas de dia. 
+
+### Colunas padrão
+
+* `ts_ref`
+* `dt_ref_date`
+* `mes_ref_yyyymm`
+
+### Exemplo
+
+```sql
+CREATE OR REPLACE VIEW workspace_db.vw_base_eventos_iceberg AS
+SELECT
+    event_time AS ts_ref,
+    cast(event_time as date) AS dt_ref_date,
+    cast(date_format(event_time, '%Y%m') as integer) AS mes_ref_yyyymm,
+    contrato,
+    produto,
+    evento,
+    valor
+FROM workspace_db.eventos_iceberg;
+```
+
+### Filtro correto
+
+```sql
+WHERE ts_ref >= TIMESTAMP '2026-02-01 00:00:00'
+  AND ts_ref <  TIMESTAMP '2026-02-02 00:00:00'
+```
+
+---
+
+# 5. Padrão de camadas de view
+
+# 5.1 `vw_base_*`
+
+## Objetivo
+
+Padronizar interface e preservar física.
+
+## Deve conter
+
+* partição física `p_*`
+* colunas canônicas temporais
+* chaves naturais
+* colunas cruas
+* grão explícito
+
+## Não deve conter
+
+* agregação precoce
+* lógica de negócio pesada
+* supressão da partição física
+
+### Exemplo
+
+```sql
+CREATE OR REPLACE VIEW workspace_db.vw_base_carteira_vigor AS
+SELECT
+    anomes AS p_anomes,
+    dt_foto AS p_dt_foto,
+    cast(anomes as integer) AS mes_ref_yyyymm,
+    cast(dt_foto as integer) AS dt_ref_yyyymmdd,
+    contrato,
+    produto,
+    cnpj_raiz,
+    escritorio,
+    fila,
+    cluster_rv,
+    atr_ctr,
+    vl_ser,
+    vl_saldo
+FROM workspace_db.raw_carteira_vigor;
+```
+
+---
+
+# 5.2 `vw_sem_*`
+
+## Objetivo
+
+Centralizar joins recorrentes e semântica de negócio.
+
+## Deve conter
+
+* herança da partição física
+* enriquecimento
+* flags
+* de/para
+* classificação
+
+## Não deve conter
+
+* ocultação da física
+* janelas temporais arbitrárias acopladas
+* agregação analítica final
+
+### Exemplo
+
+```sql
+CREATE OR REPLACE VIEW workspace_db.vw_sem_contrato_status AS
+SELECT
+    b.p_anomes,
+    b.p_dt_foto,
+    b.mes_ref_yyyymm,
+    b.dt_ref_yyyymmdd,
+    b.contrato,
+    b.produto,
+    b.cnpj_raiz,
+    b.escritorio,
+    b.fila,
+    b.cluster_rv,
+    b.atr_ctr,
+    b.vl_ser,
+    b.vl_saldo,
+    CASE
+        WHEN c.flag_colchao = 1 THEN 'COLCHAO'
+        WHEN v.flag_vijud = 1 THEN 'VIJUD'
+        ELSE 'VIGOR'
+    END AS tp_carteira,
+    CASE
+        WHEN b.atr_ctr >= 360 THEN '360+'
+        WHEN b.atr_ctr >= 180 THEN '180-359'
+        WHEN b.atr_ctr >= 90  THEN '90-179'
+        WHEN b.atr_ctr >= 60  THEN '60-89'
+        ELSE '0-59'
+    END AS faixa_atraso
+FROM workspace_db.vw_base_carteira_vigor b
+LEFT JOIN workspace_db.vw_base_flags_colchao c
+  ON b.contrato = c.contrato
+ AND b.produto  = c.produto
+LEFT JOIN workspace_db.vw_base_flags_vijud v
+  ON b.contrato = v.contrato
+ AND b.produto  = v.produto;
+```
+
+---
+
+# 5.3 `vw_anl_*`
+
+## Objetivo
+
+Entregar uma visão analítica recorrente.
+
+## Deve conter
+
+* agregação útil de negócio
+* leitura simples
+* consumo fácil por BI
+
+## Não deve conter
+
+* complexidade física escondida sem necessidade
+* substituição da camada base/semântica
+* ambiguidade de grão
+
+### Exemplo
+
+```sql
+CREATE OR REPLACE VIEW workspace_db.vw_anl_estoque_mes_escritorio AS
+SELECT
+    mes_ref_yyyymm,
+    escritorio,
+    tp_carteira,
+    faixa_atraso,
+    count(*) AS qtd_registros,
+    count(distinct contrato) AS qtd_contratos,
+    sum(vl_saldo) AS vl_saldo,
+    sum(vl_ser) AS vl_ser
+FROM workspace_db.vw_sem_contrato_status
+GROUP BY 1,2,3,4;
+```
+
+---
+
+# 6. Anti-patterns proibidos
+
+## 6.1 Transformar a partição no `WHERE`
+
+### Errado
+
+```sql
+WHERE substr(cast(p_dt_foto as varchar), 1, 6) = '202602'
+```
+
+### Certo
+
+```sql
+WHERE p_dt_foto BETWEEN 20260201 AND 20260229
+```
+
+---
+
+## 6.2 Filtrar a coluna canônica em vez da física quando a física é a partição
+
+### Errado
+
+```sql
+WHERE mes_ref_yyyymm = 202602
+```
+
+### Certo
+
+```sql
+WHERE p_anomes = 202602
+```
+
+ou
+
+```sql
+WHERE p_dt_ref BETWEEN '2026-02-01' AND '2026-02-28'
+```
+
+---
+
+## 6.3 View “bonita” que apaga a física
+
+### Errado
+
+```sql
+CREATE VIEW vw_x AS
+SELECT
+    cast(p_dt_ref as date) as dt_ref_date,
+    date_trunc('month', cast(p_dt_ref as date)) as mes_ref
+FROM tabela;
+```
+
+### Certo
+
+```sql
+CREATE VIEW vw_x AS
+SELECT
+    p_dt_ref,
+    cast(p_dt_ref as date) as dt_ref_date,
+    cast(replace(substr(p_dt_ref,1,7),'-','') as integer) as mes_ref_yyyymm
+FROM tabela;
+```
+
+---
+
+## 6.4 Agregar cedo demais
+
+### Errado
+
+```sql
+CREATE VIEW vw_fluxo AS
+SELECT
+    escritorio,
+    sum(vl_pago) as vl_pago
+FROM pagamentos
+GROUP BY 1;
+```
+
+### Problema
+
+Depois disso, você perde o vínculo com a partição e com o grão real.
+
+---
+
+## 6.5 Repetir join em toda query
+
+O próprio material de SQL reaproveitável trata isso como anti-pattern claro: join repetido, lógica misturada e cópia de query inteira geram dívida técnica invisível.  
+
+---
+
+# 7. Padrão recomendado para seu domínio de cobrança
+
+## Camada base
+
+* `vw_base_carteira_vigor`
+* `vw_base_colchao`
+* `vw_base_vijud`
+* `vw_base_boletos`
+* `vw_base_pagamentos`
+* `vw_base_opc_baixas`
+
+## Camada semântica
+
+* `vw_sem_contrato_status`
+* `vw_sem_pagamento_conciliado`
+* `vw_sem_cliente_carteira_atual`
+* `vw_sem_faixa_atraso`
+
+## Camada analítica
+
+* `vw_anl_estoque_mes`
+* `vw_anl_fluxo_mensal`
+* `vw_anl_quebra_acordo`
+* `vw_anl_pagadoria_base`
+
+---
+
+# 8. Template oficial de `vw_base`
+
+```sql
+CREATE OR REPLACE VIEW workspace_db.vw_base_<entidade> AS
+SELECT
+    -- física
+    <particao_fisica_1> AS p_<particao_fisica_1>,
+    <particao_fisica_2> AS p_<particao_fisica_2>,
+
+    -- canônicas
+    <expressao_mes> AS mes_ref_yyyymm,
+    <expressao_dia> AS dt_ref_yyyymmdd,
+    <expressao_data> AS dt_ref_date,
+    <expressao_timestamp> AS ts_ref,
+
+    -- chaves
+    contrato,
+    produto,
+    cnpj_raiz,
+
+    -- negócio cru
+    escritorio,
+    fila,
+    cluster_rv,
+    atr_ctr,
+    vl_saldo,
+    vl_ser
+FROM workspace_db.<tabela_origem>;
+```
+
+---
+
+# 9. Template oficial de `vw_sem`
+
+```sql
+CREATE OR REPLACE VIEW workspace_db.vw_sem_<entidade> AS
+SELECT
+    b.p_<particao_fisica_1>,
+    b.p_<particao_fisica_2>,
+    b.mes_ref_yyyymm,
+    b.dt_ref_yyyymmdd,
+    b.dt_ref_date,
+    b.ts_ref,
+    b.contrato,
+    b.produto,
+    b.cnpj_raiz,
+    b.escritorio,
+    b.fila,
+    b.cluster_rv,
+    b.atr_ctr,
+    b.vl_saldo,
+    b.vl_ser,
+
+    -- enriquecimento
+    coalesce(f.flag_x, 0) as flag_x,
+    coalesce(f.flag_y, 0) as flag_y,
+
+    -- regra
+    case
+        when coalesce(f.flag_x, 0) = 1 then 'CLASSE_X'
+        when coalesce(f.flag_y, 0) = 1 then 'CLASSE_Y'
+        else 'CLASSE_Z'
+    end as tp_status
+
+FROM workspace_db.vw_base_<entidade> b
+LEFT JOIN workspace_db.vw_base_<flags> f
+  ON b.contrato = f.contrato
+ AND b.produto  = f.produto;
+```
+
+---
+
+# 10. Template oficial de `vw_anl`
+
+```sql
+CREATE OR REPLACE VIEW workspace_db.vw_anl_<entidade> AS
+SELECT
+    mes_ref_yyyymm,
+    escritorio,
+    tp_status,
+    count(*) as qtd_registros,
+    count(distinct contrato) as qtd_contratos,
+    sum(vl_saldo) as vl_saldo,
+    sum(vl_ser) as vl_ser
+FROM workspace_db.vw_sem_<entidade>
+GROUP BY 1,2,3;
+```
+
+---
+
+# 11. Quando sair de view e virar tabela
+
+Transforme em `tb_gold_*` quando a lógica for:
+
+* pesada
+* recorrente
+* base de QuickSight
+* usada por muitas views
+* usada em pipeline agendado
+
+Nesse cenário, materializar costuma ser melhor do que recalcular a view toda hora. Athena suporta CTAS e particionamento para restringir o volume escaneado, e Step Functions consegue orquestrar essas execuções.  
+
+---
+
+# 12. Regras de materialização
+
+## 12.1 Exemplo de CTAS
+
+```sql
+CREATE TABLE workspace_db.tb_gold_pagamento_conciliado
+WITH (
+  format = 'PARQUET',
+  partitioned_by = ARRAY['p_anomes']
+) AS
+SELECT
+    p_anomes,
+    mes_ref_yyyymm,
+    contrato,
+    produto,
+    escritorio,
+    tp_status,
+    vl_pago
+FROM workspace_db.vw_sem_pagamento_conciliado;
+```
+
+## 12.2 Regra
+
+Se a tabela particionada tiver muitas partições, avalie:
+
+* projection
+* partition index
+* ranges realistas
+* filtros em todas as chaves
+
+porque o guia do Athena alerta para lookup caro de partições e para o uso disciplinado de predicados em todas as chaves particionadas.  
+
+---
+
+# 13. Checklist de publicação
+
+## Checklist de `vw_base_*`
+
+* [ ] expõe a partição física `p_*`
+* [ ] expõe `mes_ref_yyyymm`
+* [ ] expõe `dt_ref_yyyymmdd` quando aplicável
+* [ ] grão explícito
+* [ ] sem agregação precoce
+* [ ] sem lógica pesada de negócio
+
+## Checklist de `vw_sem_*`
+
+* [ ] herda `p_*`
+* [ ] centraliza joins recorrentes
+* [ ] centraliza regra de negócio
+* [ ] não esconde física
+* [ ] não acopla janela variável
+
+## Checklist de `vw_anl_*`
+
+* [ ] grão final claro
+* [ ] agregação recorrente
+* [ ] pronta para BI
+* [ ] não tenta substituir base e semântica
+
+## Checklist de query de consumo
+
+* [ ] filtro usa a coluna física de partição
+* [ ] não usa `cast`, `substr`, `date_parse` no `WHERE` da partição
+* [ ] em Hive com timestamp, filtra também a partição física
+* [ ] em Iceberg, usa range de dia inteiro quando aplicável
+
+---
+
+# 14. Matriz Hive vs Iceberg
+
+| tema                                         | Hive                        | Iceberg                              |
+| -------------------------------------------- | --------------------------- | ------------------------------------ |
+| partição física explícita                    | normalmente sim             | pode ser hidden                      |
+| pruning por coluna derivada de timestamp     | mais fraco                  | melhor                               |
+| necessidade de expor partição física na view | muito alta                  | alta, mas pode variar                |
+| filtro ideal                                 | partição + tempo de negócio | tempo de negócio em range compatível |
+| melhor caso temporal                         | `p_event_date` + `ts_ref`   | `ts_ref` em dia cheio                |
+
+---
+
+# 15. Regra final de arquitetura
+
+> **View forte não é a que deixa o SQL mais bonito.
+> View forte é a que preserva a física, centraliza a semântica e mantém o motor eficiente.**
+
+---
+
+# 16. Próximos passos recomendados
+
+1. escolher 3 tabelas reais suas:
+
+   * uma com `anomes`
+   * uma com `dt_foto`
+   * uma com `dt_ref`
+
+2. criar uma `vw_base_*` para cada uma
+
+3. padronizar:
+
+   * `p_*`
+   * `mes_ref_yyyymm`
+   * `dt_ref_yyyymmdd`
+   * `dt_ref_date`
+
+4. criar uma `vw_sem_*` de status de contrato
+
+5. testar com `EXPLAIN`:
+
+   * query na tabela original
+   * query na view
+   * mesma condição de partição
+
+6. materializar em `tb_gold_*` o que for recorrente e pesado
+
+---
+
+```
+
+Se você quiser, no próximo passo eu monto uma **versão 2 já preenchida com nomes do seu domínio** — por exemplo `vw_base_carteira_vigor`, `vw_sem_pagamento_conciliado` e `vw_anl_pagadoria_base` com SQL mais próximo do seu ambiente.
+```
