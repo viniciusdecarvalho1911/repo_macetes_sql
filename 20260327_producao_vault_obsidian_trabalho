@@ -1,0 +1,1642 @@
+Perfeito. Vou te entregar as **duas coisas juntas**:
+
+1. **o SQL na íntegra**, já comentado e pensado como query + material instrutivo
+2. **uma biblioteca inicial no estilo “dbt mental” para Obsidian**, já baseada nesse processo
+
+Vou estruturar isso para você conseguir:
+
+* usar a query
+* estudar a query
+* quebrar a query em blocos reutilizáveis
+* documentar tudo no Obsidian
+* achar cada pedaço rápido depois
+
+---
+
+# Parte 1 — Query completa na íntegra
+
+Abaixo está a versão consolidada e comentada.
+
+```sql
+-- =====================================================================================
+-- QUERY: PAGAMENTOS CONSOLIDADOS COM META, GATE E COMISSIONAMENTO
+-- =====================================================================================
+-- OBJETIVO:
+--   Consolidar pagamentos elegíveis a partir da carteira vigor, removendo contratos
+--   presentes no colchão e no vijud do início do mês, unificando múltiplas fontes
+--   de pagamento, aplicando regra de desconto, derivando caixa/regul, confrontando
+--   com meta e chegando ao percentual de comissão por escritório.
+--
+-- ESTA QUERY FOI ESCRITA PARA SERVIR A DOIS PROPÓSITOS:
+--   1) execução prática
+--   2) material didático / modelo de arquitetura SQL
+--
+-- PADRÃO ADOTADO:
+--   parametros -> base principal -> satélites -> enriquecimento -> regras
+--   -> agregação -> output final
+--
+-- OBSERVAÇÃO:
+--   Os nomes das views abaixo são exemplos estruturados.
+--   Ajuste para os nomes reais do seu ambiente.
+-- =====================================================================================
+
+WITH
+
+-- =====================================================================================
+-- 1) PARÂMETROS
+-- -------------------------------------------------------------------------------------
+-- Centraliza tudo que muda com frequência:
+-- - competência
+-- - janela de pagamentos
+-- - data de foto do vijud usada para exclusão
+--
+-- Benefícios:
+-- - evita filtros espalhados
+-- - facilita manutenção
+-- - ajuda a transformar a query em "template" reaproveitável
+-- =====================================================================================
+parametros AS (
+    SELECT
+        202602 AS p_anomes,
+        20260201 AS p_dt_inicio_mes,
+        20260229 AS p_dt_fim_mes,
+        20260201 AS p_dt_vijud_inicio_mes
+),
+
+-- =====================================================================================
+-- 2) BASE PRINCIPAL: CARTEIRA VIGOR
+-- -------------------------------------------------------------------------------------
+-- Esta é a base principal da análise.
+--
+-- GRÃO:
+--   1 linha por contrato + produto dentro da carteira vigor da competência
+--
+-- Repare que o filtro usa a coluna física de partição p_anomes.
+-- Esse é o jeito certo de preservar pruning quando isso existe na base.
+-- =====================================================================================
+carteira_vigor AS (
+    SELECT
+        v.p_anomes,
+        v.contrato,
+        v.produto,
+        v.cnpj_raiz,
+        v.escritorio,
+        v.fila,
+        v.cluster_rv,
+        v.atr_ctr,
+        v.vl_saldo_gerencial
+    FROM workspace_db.vw_base_carteira_vigor v
+    CROSS JOIN parametros p
+    WHERE v.p_anomes = p.p_anomes
+),
+
+-- =====================================================================================
+-- 3) SATÉLITE: COLCHÃO DO MÊS
+-- -------------------------------------------------------------------------------------
+-- Esta CTE existe apenas para apoiar a exclusão de contratos que estejam no colchão.
+--
+-- DISTINCT é usado para evitar multiplicação desnecessária no join posterior.
+-- =====================================================================================
+colchao_mes AS (
+    SELECT DISTINCT
+        c.contrato,
+        c.produto
+    FROM workspace_db.vw_base_colchao c
+    CROSS JOIN parametros p
+    WHERE c.p_anomes = p.p_anomes
+),
+
+-- =====================================================================================
+-- 4) SATÉLITE: VIJUD NO INÍCIO DO MÊS
+-- -------------------------------------------------------------------------------------
+-- Esta CTE captura quem estava no vijud na foto usada como corte.
+--
+-- Regra de negócio simulada:
+--   contratos presentes aqui serão excluídos da carteira elegível.
+-- =====================================================================================
+vijud_inicio_mes AS (
+    SELECT DISTINCT
+        j.contrato,
+        j.produto
+    FROM workspace_db.vw_base_vijud_inicio_mes j
+    CROSS JOIN parametros p
+    WHERE j.p_dt_foto = p.p_dt_vijud_inicio_mes
+),
+
+-- =====================================================================================
+-- 5) CARTEIRA ELEGÍVEL
+-- -------------------------------------------------------------------------------------
+-- Regra:
+--   carteira_vigor
+--   menos colchao_mes
+--   menos vijud_inicio_mes
+--
+-- Técnica:
+--   LEFT JOIN + IS NULL
+--
+-- É uma forma muito boa de representar exclusão de conjuntos de forma auditável.
+-- =====================================================================================
+carteira_elegivel AS (
+    SELECT
+        v.*
+    FROM carteira_vigor v
+    LEFT JOIN colchao_mes c
+        ON v.contrato = c.contrato
+       AND v.produto  = c.produto
+    LEFT JOIN vijud_inicio_mes j
+        ON v.contrato = j.contrato
+       AND v.produto  = j.produto
+    WHERE c.contrato IS NULL
+      AND j.contrato IS NULL
+),
+
+-- =====================================================================================
+-- 6) SATÉLITE: BOLETOS PAGOS VÁLIDOS
+-- -------------------------------------------------------------------------------------
+-- Esta é a primeira fonte de pagamento.
+--
+-- Regras:
+--   - considera a janela do mês
+--   - descarta boletos cancelados
+--
+-- Observação:
+--   Se sua base tiver partição física específica (ex.: p_dt_ref), prefira filtrar por ela.
+-- =====================================================================================
+boletos_validos AS (
+    SELECT
+        b.contrato,
+        b.produto,
+        b.boleto,
+        b.dt_pagamento,
+        b.vl_pago,
+        b.vl_desconto_boleto,
+        'BOLETO' AS origem_pagamento
+    FROM workspace_db.vw_base_boletos_pagos b
+    CROSS JOIN parametros p
+    WHERE b.dt_ref_yyyymmdd BETWEEN p.p_dt_inicio_mes AND p.p_dt_fim_mes
+      AND COALESCE(b.flag_cancelado, 0) = 0
+),
+
+-- =====================================================================================
+-- 7) SATÉLITE: DÉBITO EM CONTA
+-- -------------------------------------------------------------------------------------
+-- Segunda fonte de pagamento.
+--
+-- Aqui alguns campos não existem da mesma forma que em boletos.
+-- Por isso padronizamos o layout para permitir UNION ALL depois.
+-- =====================================================================================
+debito_conta AS (
+    SELECT
+        d.contrato,
+        d.produto,
+        CAST(NULL AS VARCHAR) AS boleto,
+        d.dt_pagamento,
+        d.vl_pago,
+        CAST(NULL AS DECIMAL(18,4)) AS vl_desconto_boleto,
+        'DEBITO_CONTA' AS origem_pagamento
+    FROM workspace_db.vw_base_debito_conta d
+    CROSS JOIN parametros p
+    WHERE d.dt_ref_yyyymmdd BETWEEN p.p_dt_inicio_mes AND p.p_dt_fim_mes
+),
+
+-- =====================================================================================
+-- 8) SATÉLITE: FLUXO APARTADO / BACK OFFICE
+-- -------------------------------------------------------------------------------------
+-- Terceira fonte de pagamento.
+--
+-- De novo, padronizamos o layout para facilitar a consolidação posterior.
+-- =====================================================================================
+fluxo_apartado AS (
+    SELECT
+        f.contrato,
+        f.produto,
+        CAST(NULL AS VARCHAR) AS boleto,
+        f.dt_pagamento,
+        f.vl_pago,
+        CAST(NULL AS DECIMAL(18,4)) AS vl_desconto_boleto,
+        'BACKOFFICE' AS origem_pagamento
+    FROM workspace_db.vw_base_fluxo_apartado f
+    CROSS JOIN parametros p
+    WHERE f.dt_ref_yyyymmdd BETWEEN p.p_dt_inicio_mes AND p.p_dt_fim_mes
+),
+
+-- =====================================================================================
+-- 9) UNIÃO BRUTA DAS FONTES
+-- -------------------------------------------------------------------------------------
+-- Nesta etapa ainda não deduplicamos.
+-- Apenas empilhamos as fontes.
+--
+-- UNION ALL é proposital:
+--   - é mais barato
+--   - não mascara duplicidade
+--   - deixa a deduplicação explícita na próxima etapa
+-- =====================================================================================
+pagamentos_brutos AS (
+    SELECT * FROM boletos_validos
+    UNION ALL
+    SELECT * FROM debito_conta
+    UNION ALL
+    SELECT * FROM fluxo_apartado
+),
+
+-- =====================================================================================
+-- 10) DEDUPLICAÇÃO MULTIORIGEM
+-- -------------------------------------------------------------------------------------
+-- Esta é uma das etapas mais importantes da query.
+--
+-- Problema:
+--   o mesmo pagamento pode aparecer em mais de uma origem
+--
+-- Estratégia:
+--   usamos ROW_NUMBER para manter apenas 1 linha por evento de pagamento
+--
+-- CHAVE DE DEDUP DO EXEMPLO:
+--   contrato + produto + dt_pagamento + vl_pago
+--
+-- IMPORTANTE:
+--   isso é só um modelo didático
+--   no seu ambiente real talvez você precise incluir boleto, id_evento, parcela etc.
+--
+-- ORDEM DE PREFERÊNCIA:
+--   1) BOLETO
+--   2) DEBITO_CONTA
+--   3) BACKOFFICE
+-- =====================================================================================
+pagamentos_dedup AS (
+    SELECT
+        x.contrato,
+        x.produto,
+        x.boleto,
+        x.dt_pagamento,
+        x.vl_pago,
+        x.vl_desconto_boleto,
+        x.origem_pagamento
+    FROM (
+        SELECT
+            p.*,
+            ROW_NUMBER() OVER (
+                PARTITION BY
+                    p.contrato,
+                    p.produto,
+                    p.dt_pagamento,
+                    p.vl_pago
+                ORDER BY
+                    CASE p.origem_pagamento
+                        WHEN 'BOLETO' THEN 1
+                        WHEN 'DEBITO_CONTA' THEN 2
+                        WHEN 'BACKOFFICE' THEN 3
+                        ELSE 99
+                    END
+            ) AS rn
+        FROM pagamentos_brutos p
+    ) x
+    WHERE x.rn = 1
+),
+
+-- =====================================================================================
+-- 11) PAGAMENTOS ELEGÍVEIS
+-- -------------------------------------------------------------------------------------
+-- Agora cruzamos:
+--   carteira elegível
+--   com
+--   pagamentos deduplicados
+--
+-- Resultado:
+--   ficamos apenas com pagamentos ligados à carteira válida da competência
+-- =====================================================================================
+pagamentos_elegiveis AS (
+    SELECT
+        c.p_anomes,
+        c.contrato,
+        c.produto,
+        c.cnpj_raiz,
+        c.escritorio,
+        c.fila,
+        c.cluster_rv,
+        c.atr_ctr,
+        c.vl_saldo_gerencial,
+        p.boleto,
+        p.dt_pagamento,
+        p.vl_pago,
+        p.vl_desconto_boleto,
+        p.origem_pagamento
+    FROM carteira_elegivel c
+    INNER JOIN pagamentos_dedup p
+        ON c.contrato = p.contrato
+       AND c.produto  = p.produto
+),
+
+-- =====================================================================================
+-- 12) PROPOSTA DE NEGÓCIO MAIS RECENTE
+-- -------------------------------------------------------------------------------------
+-- Se o desconto não vier do boleto, buscamos na proposta de negócio.
+--
+-- Regra simulada:
+--   pega a proposta mais recente por contrato/produto/boleto
+--
+-- IMPORTANTE:
+--   se o seu negócio exigir "proposta válida na data do pagamento",
+--   essa lógica precisará evoluir para join temporal.
+-- =====================================================================================
+proposta_negocio_raw AS (
+    SELECT
+        pn.contrato,
+        pn.produto,
+        pn.boleto,
+        pn.tp_acordo,
+        pn.perc_desconto,
+        pn.dt_referencia,
+        ROW_NUMBER() OVER (
+            PARTITION BY
+                pn.contrato,
+                pn.produto,
+                COALESCE(pn.boleto, 'SEM_BOLETO')
+            ORDER BY pn.dt_referencia DESC
+        ) AS rn
+    FROM workspace_db.vw_base_proposta_negocio pn
+),
+
+proposta_negocio AS (
+    SELECT
+        contrato,
+        produto,
+        boleto,
+        tp_acordo,
+        perc_desconto
+    FROM proposta_negocio_raw
+    WHERE rn = 1
+),
+
+-- =====================================================================================
+-- 13) DESCONTO FINAL
+-- -------------------------------------------------------------------------------------
+-- Regra:
+--   1) tenta o desconto vindo da base de boletos
+--   2) se não houver, tenta a proposta de negócio
+--   3) se nada existir, assume 0
+--
+-- Também traz o tipo de acordo, que será usado na regra de caixa vs regul.
+-- =====================================================================================
+pagamentos_com_desconto AS (
+    SELECT
+        p.p_anomes,
+        p.contrato,
+        p.produto,
+        p.cnpj_raiz,
+        p.escritorio,
+        p.fila,
+        p.cluster_rv,
+        p.atr_ctr,
+        p.vl_saldo_gerencial,
+        p.boleto,
+        p.dt_pagamento,
+        p.vl_pago,
+        p.origem_pagamento,
+        pr.tp_acordo,
+        COALESCE(
+            p.vl_desconto_boleto,
+            pr.perc_desconto,
+            0
+        ) AS perc_desconto_final
+    FROM pagamentos_elegiveis p
+    LEFT JOIN proposta_negocio pr
+        ON p.contrato = pr.contrato
+       AND p.produto  = pr.produto
+       AND COALESCE(p.boleto, 'SEM_BOLETO') = COALESCE(pr.boleto, 'SEM_BOLETO')
+),
+
+-- =====================================================================================
+-- 14) REGRAS FINANCEIRAS
+-- -------------------------------------------------------------------------------------
+-- Regra de negócio principal:
+--
+-- Se for À VISTA:
+--   vl_caixa = vl_pago
+--   vl_regul = 0
+--
+-- Caso contrário:
+--   vl_caixa = 0
+--   vl_regul = saldo_gerencial - (saldo_gerencial * desconto)
+--
+-- IMPORTANTE:
+--   esta fórmula é um exemplo baseado no seu enunciado.
+--   confirme com o negócio se desconto está em formato decimal (ex.: 0.25)
+--   e se regul deve mesmo sair do saldo gerencial por essa fórmula.
+-- =====================================================================================
+regras_financeiras AS (
+    SELECT
+        p.*,
+
+        CASE
+            WHEN UPPER(COALESCE(p.tp_acordo, '')) IN ('AVISTA', 'A VISTA', 'A_VISTA')
+                THEN p.vl_pago
+            ELSE 0
+        END AS vl_caixa,
+
+        CASE
+            WHEN UPPER(COALESCE(p.tp_acordo, '')) IN ('AVISTA', 'A VISTA', 'A_VISTA')
+                THEN 0
+            ELSE p.vl_saldo_gerencial
+                 - (p.vl_saldo_gerencial * p.perc_desconto_final)
+        END AS vl_regul
+    FROM pagamentos_com_desconto p
+),
+
+-- =====================================================================================
+-- 15) AGREGAÇÃO POR ESCRITÓRIO
+-- -------------------------------------------------------------------------------------
+-- A partir daqui entramos no mundo analítico.
+--
+-- GRÃO:
+--   competência + escritório
+-- =====================================================================================
+resultado_escritorio AS (
+    SELECT
+        p_anomes,
+        escritorio,
+        COUNT(DISTINCT contrato) AS qtd_contratos_pagantes,
+        SUM(vl_caixa) AS vl_caixa,
+        SUM(vl_regul) AS vl_regul
+    FROM regras_financeiras
+    GROUP BY 1,2
+),
+
+-- =====================================================================================
+-- 16) META DO ESCRITÓRIO
+-- -------------------------------------------------------------------------------------
+-- A meta precisa estar no mesmo grão da apuração final.
+-- =====================================================================================
+meta_escritorio AS (
+    SELECT
+        m.p_anomes,
+        m.escritorio,
+        m.vl_meta_regul
+    FROM workspace_db.vw_base_meta_escritorio m
+    CROSS JOIN parametros p
+    WHERE m.p_anomes = p.p_anomes
+),
+
+-- =====================================================================================
+-- 17) RESULTADO x META
+-- -------------------------------------------------------------------------------------
+-- Aqui calculamos o percentual de atingimento.
+--
+-- Proteção:
+--   evita divisão por zero
+-- =====================================================================================
+resultado_meta AS (
+    SELECT
+        r.p_anomes,
+        r.escritorio,
+        r.qtd_contratos_pagantes,
+        r.vl_caixa,
+        r.vl_regul,
+        m.vl_meta_regul,
+        CASE
+            WHEN COALESCE(m.vl_meta_regul, 0) > 0
+                THEN r.vl_regul / m.vl_meta_regul
+            ELSE NULL
+        END AS perc_atingimento
+    FROM resultado_escritorio r
+    LEFT JOIN meta_escritorio m
+        ON r.p_anomes   = m.p_anomes
+       AND r.escritorio = m.escritorio
+),
+
+-- =====================================================================================
+-- 18) GATE / COMISSIONAMENTO
+-- -------------------------------------------------------------------------------------
+-- Idealmente isso vem de uma tabela de regra (lookup/de-para), e não de CASE gigante.
+--
+-- Exemplo de colunas esperadas:
+--   escritorio
+--   faixa_ini
+--   faixa_fim
+--   gate
+--   perc_comissao
+-- =====================================================================================
+gate_comissao AS (
+    SELECT
+        g.escritorio,
+        g.faixa_ini,
+        g.faixa_fim,
+        g.gate,
+        g.perc_comissao
+    FROM workspace_db.vw_base_gate_comissionamento g
+),
+
+-- =====================================================================================
+-- 19) LOOKUP FINAL DO GATE
+-- -------------------------------------------------------------------------------------
+-- Atenção:
+--   as faixas de gate não podem se sobrepor.
+--   Se houver sobreposição, um escritório pode casar com mais de uma linha.
+-- =====================================================================================
+resultado_final AS (
+    SELECT
+        r.p_anomes,
+        r.escritorio,
+        r.qtd_contratos_pagantes,
+        r.vl_caixa,
+        r.vl_regul,
+        r.vl_meta_regul,
+        r.perc_atingimento,
+        g.gate,
+        g.perc_comissao,
+        r.vl_regul * g.perc_comissao AS vl_comissao
+    FROM resultado_meta r
+    LEFT JOIN gate_comissao g
+        ON r.escritorio = g.escritorio
+       AND r.perc_atingimento >= g.faixa_ini
+       AND r.perc_atingimento <  g.faixa_fim
+)
+
+-- =====================================================================================
+-- 20) OUTPUT FINAL
+-- -------------------------------------------------------------------------------------
+-- O output final deve ficar simples.
+-- Se o select final estiver caótico, normalmente a modelagem anterior ainda está ruim.
+-- =====================================================================================
+SELECT
+    p_anomes,
+    escritorio,
+    qtd_contratos_pagantes,
+    vl_caixa,
+    vl_regul,
+    vl_meta_regul,
+    perc_atingimento,
+    gate,
+    perc_comissao,
+    vl_comissao
+FROM resultado_final
+ORDER BY
+    p_anomes,
+    escritorio;
+```
+
+---
+
+# Parte 2 — Biblioteca inicial para Obsidian
+
+Agora vou te devolver uma **biblioteca inicial pronta**, já baseada nessa query.
+
+A ideia é você criar notas pequenas, cada uma representando uma “função mental reutilizável”.
+
+---
+
+## Estrutura de pastas recomendada
+
+```text
+SQL/
+├── 00_index/
+│   └── biblioteca_sql.md
+├── 01_base/
+├── 02_join/
+├── 03_regra_negocio/
+├── 04_metrica/
+├── 05_modelo/
+├── 06_pipeline/
+├── 07_template/
+```
+
+---
+
+## 1. Nota índice — `biblioteca_sql.md`
+
+```markdown
+# 🧠 Biblioteca SQL
+
+## 🧱 Modelos
+
+### Base
+- [[vw_base_carteira_vigor]]
+- [[vw_base_colchao]]
+- [[vw_base_vijud_inicio_mes]]
+- [[vw_base_boletos_pagos]]
+- [[vw_base_debito_conta]]
+- [[vw_base_fluxo_apartado]]
+- [[vw_base_proposta_negocio]]
+- [[vw_base_meta_escritorio]]
+- [[vw_base_gate_comissionamento]]
+
+### Semântica
+- [[vw_sem_carteira_elegivel_pagamento]]
+- [[vw_sem_pagamentos_multiorigem]]
+- [[vw_sem_pagamentos_com_desconto]]
+- [[vw_sem_pagamento_consolidado]]
+
+### Analítica
+- [[tb_gld_anl_pagadoria_escritorio_mes]]
+
+## 🧩 Blocos reutilizáveis
+
+### Join
+- [[join_exclusao_colchao_vijud]]
+- [[join_pagamentos_multiorigem]]
+- [[join_proposta_negocio_recente]]
+- [[join_gate_comissionamento]]
+
+### Regras de negócio
+- [[regra_carteira_elegivel]]
+- [[regra_deduplicacao_pagamentos]]
+- [[regra_desconto_final]]
+- [[regra_calculo_caixa]]
+- [[regra_calculo_regul]]
+- [[regra_atingimento_meta]]
+
+### Métricas
+- [[metrica_vl_caixa]]
+- [[metrica_vl_regul]]
+- [[metrica_perc_atingimento]]
+- [[metrica_vl_comissao]]
+
+## 🏗 Pipelines
+- [[pipeline_pagamento_consolidado]]
+- [[pipeline_pagadoria_escritorio_mes]]
+```
+
+---
+
+## 2. Templates
+
+---
+
+### Template de bloco reutilizável
+
+````markdown
+---
+tipo: sql_bloco
+categoria:
+tags: [sql]
+reutilizavel: true
+dominio: cobranca
+---
+
+# 🧩 {{title}}
+
+## 🎯 O que faz
+
+## 📥 Inputs
+- 
+
+## 📤 Outputs
+- 
+
+## 🧠 Regra
+
+## 💻 SQL
+```sql
+
+````
+
+## 🔗 Usado em
+
+*
+
+````
+
+---
+
+### Template de modelo
+
+```markdown
+---
+tipo: modelo
+camada:
+materializacao:
+tags: [sql, modelo]
+dominio: cobranca
+---
+
+# 🧱 {{title}}
+
+## 🎯 Objetivo
+
+## 🧠 Lógica de negócio
+
+## 📊 Grão
+
+## 🔗 Dependências
+- 
+
+## 💻 SQL
+```sql
+
+````
+
+## ⚠️ Cuidados
+
+*
+
+````
+
+---
+
+### Template de pipeline
+
+```markdown
+---
+tipo: pipeline
+tags: [pipeline, cobranca]
+dominio: cobranca
+---
+
+# 🏗 {{title}}
+
+## 🎯 Objetivo
+
+## 🔄 Fluxo
+1. 
+2. 
+3. 
+
+## 🧠 Regras principais
+- 
+
+## ⏱ Frequência
+
+## 📊 Output final
+- 
+````
+
+---
+
+# 3. Biblioteca inicial — blocos prontos
+
+Abaixo vão as notas iniciais que eu criaria.
+
+---
+
+## `regra_carteira_elegivel`
+
+````markdown
+---
+tipo: sql_bloco
+categoria: regra_negocio
+tags: [sql, carteira, elegibilidade]
+reutilizavel: true
+dominio: cobranca
+---
+
+# 🧩 regra_carteira_elegivel
+
+## 🎯 O que faz
+Define a carteira elegível para pagamento a partir da vigor, removendo colchão e vijud do início do mês.
+
+## 📥 Inputs
+- contrato
+- produto
+- carteira_vigor
+- base_colchao
+- base_vijud_inicio_mes
+
+## 📤 Outputs
+- contrato elegível
+- produto elegível
+
+## 🧠 Regra
+Carteira elegível = vigor do mês - colchão do mês - vijud do início do mês.
+
+## 💻 SQL
+```sql
+SELECT
+    v.*
+FROM carteira_vigor v
+LEFT JOIN colchao_mes c
+    ON v.contrato = c.contrato
+   AND v.produto  = c.produto
+LEFT JOIN vijud_inicio_mes j
+    ON v.contrato = j.contrato
+   AND v.produto  = j.produto
+WHERE c.contrato IS NULL
+  AND j.contrato IS NULL
+````
+
+## 🔗 Usado em
+
+* [[vw_sem_carteira_elegivel_pagamento]]
+* [[pipeline_pagamento_consolidado]]
+
+````
+
+---
+
+## `join_exclusao_colchao_vijud`
+
+```markdown
+---
+tipo: sql_bloco
+categoria: join
+tags: [sql, join, exclusao]
+reutilizavel: true
+dominio: cobranca
+---
+
+# 🧩 join_exclusao_colchao_vijud
+
+## 🎯 O que faz
+Aplica exclusão de contratos presentes em colchão e vijud no início do mês.
+
+## 📥 Inputs
+- carteira_vigor
+- colchao_mes
+- vijud_inicio_mes
+
+## 📤 Outputs
+- carteira filtrada
+
+## 🧠 Regra
+Usa LEFT JOIN + IS NULL para excluir conjuntos de contratos.
+
+## 💻 SQL
+```sql
+LEFT JOIN colchao_mes c
+    ON v.contrato = c.contrato
+   AND v.produto  = c.produto
+LEFT JOIN vijud_inicio_mes j
+    ON v.contrato = j.contrato
+   AND v.produto  = j.produto
+WHERE c.contrato IS NULL
+  AND j.contrato IS NULL
+````
+
+## 🔗 Usado em
+
+* [[regra_carteira_elegivel]]
+* [[vw_sem_carteira_elegivel_pagamento]]
+
+````
+
+---
+
+## `join_pagamentos_multiorigem`
+
+```markdown
+---
+tipo: sql_bloco
+categoria: join
+tags: [sql, pagamento, multiorigem]
+reutilizavel: true
+dominio: cobranca
+---
+
+# 🧩 join_pagamentos_multiorigem
+
+## 🎯 O que faz
+Padroniza e consolida as fontes de pagamento: boleto, débito em conta e back office.
+
+## 📥 Inputs
+- boletos_validos
+- debito_conta
+- fluxo_apartado
+
+## 📤 Outputs
+- pagamentos_brutos
+
+## 🧠 Regra
+Empilha as fontes com UNION ALL mantendo a origem explícita.
+
+## 💻 SQL
+```sql
+SELECT * FROM boletos_validos
+UNION ALL
+SELECT * FROM debito_conta
+UNION ALL
+SELECT * FROM fluxo_apartado
+````
+
+## 🔗 Usado em
+
+* [[vw_sem_pagamentos_multiorigem]]
+* [[pipeline_pagamento_consolidado]]
+
+````
+
+---
+
+## `regra_deduplicacao_pagamentos`
+
+```markdown
+---
+tipo: sql_bloco
+categoria: regra_negocio
+tags: [sql, dedup, pagamento]
+reutilizavel: true
+dominio: cobranca
+---
+
+# 🧩 regra_deduplicacao_pagamentos
+
+## 🎯 O que faz
+Deduplica pagamentos que aparecem em múltiplas fontes.
+
+## 📥 Inputs
+- contrato
+- produto
+- dt_pagamento
+- vl_pago
+- origem_pagamento
+
+## 📤 Outputs
+- uma única linha por evento deduplicado
+
+## 🧠 Regra
+Mantém a linha com maior prioridade de origem:
+1. BOLETO
+2. DEBITO_CONTA
+3. BACKOFFICE
+
+## 💻 SQL
+```sql
+SELECT
+    x.*
+FROM (
+    SELECT
+        p.*,
+        ROW_NUMBER() OVER (
+            PARTITION BY
+                p.contrato,
+                p.produto,
+                p.dt_pagamento,
+                p.vl_pago
+            ORDER BY
+                CASE p.origem_pagamento
+                    WHEN 'BOLETO' THEN 1
+                    WHEN 'DEBITO_CONTA' THEN 2
+                    WHEN 'BACKOFFICE' THEN 3
+                    ELSE 99
+                END
+        ) AS rn
+    FROM pagamentos_brutos p
+) x
+WHERE x.rn = 1
+````
+
+## 🔗 Usado em
+
+* [[vw_sem_pagamentos_multiorigem]]
+* [[vw_sem_pagamento_consolidado]]
+
+````
+
+---
+
+## `join_proposta_negocio_recente`
+
+```markdown
+---
+tipo: sql_bloco
+categoria: join
+tags: [sql, proposta, desconto]
+reutilizavel: true
+dominio: cobranca
+---
+
+# 🧩 join_proposta_negocio_recente
+
+## 🎯 O que faz
+Captura a proposta de negócio mais recente por contrato, produto e boleto.
+
+## 📥 Inputs
+- proposta_negocio
+
+## 📤 Outputs
+- proposta mais recente
+
+## 🧠 Regra
+Usa ROW_NUMBER ordenado por dt_referencia decrescente.
+
+## 💻 SQL
+```sql
+SELECT
+    contrato,
+    produto,
+    boleto,
+    tp_acordo,
+    perc_desconto
+FROM (
+    SELECT
+        pn.*,
+        ROW_NUMBER() OVER (
+            PARTITION BY
+                pn.contrato,
+                pn.produto,
+                COALESCE(pn.boleto, 'SEM_BOLETO')
+            ORDER BY pn.dt_referencia DESC
+        ) AS rn
+    FROM proposta_negocio pn
+) x
+WHERE rn = 1
+````
+
+## 🔗 Usado em
+
+* [[regra_desconto_final]]
+* [[vw_sem_pagamentos_com_desconto]]
+
+````
+
+---
+
+## `regra_desconto_final`
+
+```markdown
+---
+tipo: sql_bloco
+categoria: regra_negocio
+tags: [sql, desconto]
+reutilizavel: true
+dominio: cobranca
+---
+
+# 🧩 regra_desconto_final
+
+## 🎯 O que faz
+Define o desconto final aplicável ao pagamento.
+
+## 📥 Inputs
+- vl_desconto_boleto
+- perc_desconto
+- tp_acordo
+
+## 📤 Outputs
+- perc_desconto_final
+
+## 🧠 Regra
+Prioridade:
+1. desconto do boleto
+2. desconto da proposta
+3. zero
+
+## 💻 SQL
+```sql
+COALESCE(
+    p.vl_desconto_boleto,
+    pr.perc_desconto,
+    0
+) AS perc_desconto_final
+````
+
+## 🔗 Usado em
+
+* [[vw_sem_pagamentos_com_desconto]]
+* [[vw_sem_pagamento_consolidado]]
+
+````
+
+---
+
+## `regra_calculo_caixa`
+
+```markdown
+---
+tipo: sql_bloco
+categoria: regra_negocio
+tags: [sql, caixa]
+reutilizavel: true
+dominio: cobranca
+---
+
+# 🧩 regra_calculo_caixa
+
+## 🎯 O que faz
+Calcula o valor de caixa para pagamentos à vista.
+
+## 📥 Inputs
+- tp_acordo
+- vl_pago
+
+## 📤 Outputs
+- vl_caixa
+
+## 🧠 Regra
+Se o acordo for à vista, caixa = valor pago. Caso contrário, zero.
+
+## 💻 SQL
+```sql
+CASE
+    WHEN UPPER(COALESCE(tp_acordo, '')) IN ('AVISTA', 'A VISTA', 'A_VISTA')
+        THEN vl_pago
+    ELSE 0
+END AS vl_caixa
+````
+
+## 🔗 Usado em
+
+* [[vw_sem_pagamento_consolidado]]
+* [[tb_gld_anl_pagadoria_escritorio_mes]]
+
+````
+
+---
+
+## `regra_calculo_regul`
+
+```markdown
+---
+tipo: sql_bloco
+categoria: regra_negocio
+tags: [sql, regul]
+reutilizavel: true
+dominio: cobranca
+---
+
+# 🧩 regra_calculo_regul
+
+## 🎯 O que faz
+Calcula a regularização conforme a regra do acordo.
+
+## 📥 Inputs
+- tp_acordo
+- vl_saldo_gerencial
+- perc_desconto_final
+
+## 📤 Outputs
+- vl_regul
+
+## 🧠 Regra
+Se for à vista, regul = 0.  
+Caso contrário, regul = saldo gerencial - (saldo gerencial * desconto).
+
+## 💻 SQL
+```sql
+CASE
+    WHEN UPPER(COALESCE(tp_acordo, '')) IN ('AVISTA', 'A VISTA', 'A_VISTA')
+        THEN 0
+    ELSE vl_saldo_gerencial
+         - (vl_saldo_gerencial * perc_desconto_final)
+END AS vl_regul
+````
+
+## 🔗 Usado em
+
+* [[vw_sem_pagamento_consolidado]]
+* [[tb_gld_anl_pagadoria_escritorio_mes]]
+
+````
+
+---
+
+## `regra_atingimento_meta`
+
+```markdown
+---
+tipo: sql_bloco
+categoria: metrica
+tags: [sql, meta, atingimento]
+reutilizavel: true
+dominio: cobranca
+---
+
+# 🧩 regra_atingimento_meta
+
+## 🎯 O que faz
+Calcula o percentual de atingimento sobre a meta do escritório.
+
+## 📥 Inputs
+- vl_regul
+- vl_meta_regul
+
+## 📤 Outputs
+- perc_atingimento
+
+## 🧠 Regra
+Se meta for maior que zero, perc_atingimento = vl_regul / vl_meta_regul.  
+Senão, nulo.
+
+## 💻 SQL
+```sql
+CASE
+    WHEN COALESCE(vl_meta_regul, 0) > 0
+        THEN vl_regul / vl_meta_regul
+    ELSE NULL
+END AS perc_atingimento
+````
+
+## 🔗 Usado em
+
+* [[tb_gld_anl_pagadoria_escritorio_mes]]
+* [[join_gate_comissionamento]]
+
+````
+
+---
+
+## `join_gate_comissionamento`
+
+```markdown
+---
+tipo: sql_bloco
+categoria: join
+tags: [sql, gate, comissao]
+reutilizavel: true
+dominio: cobranca
+---
+
+# 🧩 join_gate_comissionamento
+
+## 🎯 O que faz
+Aplica a faixa de gate e o percentual de comissão com base no atingimento.
+
+## 📥 Inputs
+- escritorio
+- perc_atingimento
+- faixa_ini
+- faixa_fim
+
+## 📤 Outputs
+- gate
+- perc_comissao
+
+## 🧠 Regra
+O atingimento do escritório deve cair dentro do intervalo da tabela de gate.
+
+## 💻 SQL
+```sql
+LEFT JOIN gate_comissao g
+    ON r.escritorio = g.escritorio
+   AND r.perc_atingimento >= g.faixa_ini
+   AND r.perc_atingimento <  g.faixa_fim
+````
+
+## 🔗 Usado em
+
+* [[tb_gld_anl_pagadoria_escritorio_mes]]
+
+````
+
+---
+
+# 4. Modelos iniciais
+
+---
+
+## `vw_sem_carteira_elegivel_pagamento`
+
+```markdown
+---
+tipo: modelo
+camada: semantica
+materializacao: view
+tags: [sql, modelo, semantica]
+dominio: cobranca
+---
+
+# 🧱 vw_sem_carteira_elegivel_pagamento
+
+## 🎯 Objetivo
+Representar a carteira elegível para pagamentos da competência.
+
+## 🧠 Lógica de negócio
+Parte da carteira vigor e exclui contratos presentes em colchão e vijud do início do mês.
+
+## 📊 Grão
+contrato + produto + competência
+
+## 🔗 Dependências
+- [[vw_base_carteira_vigor]]
+- [[vw_base_colchao]]
+- [[vw_base_vijud_inicio_mes]]
+- [[regra_carteira_elegivel]]
+- [[join_exclusao_colchao_vijud]]
+
+## 💻 SQL
+```sql
+-- implementar com base na query principal
+````
+
+## ⚠️ Cuidados
+
+* conferir foto correta do vijud
+* conferir se colchão usa mesma competência
+
+````
+
+---
+
+## `vw_sem_pagamentos_multiorigem`
+
+```markdown
+---
+tipo: modelo
+camada: semantica
+materializacao: view
+tags: [sql, modelo, semantica]
+dominio: cobranca
+---
+
+# 🧱 vw_sem_pagamentos_multiorigem
+
+## 🎯 Objetivo
+Consolidar eventos de pagamento vindos de múltiplas origens.
+
+## 🧠 Lógica de negócio
+Empilha boleto, débito em conta e back office, depois deduplica por regra de precedência.
+
+## 📊 Grão
+evento de pagamento deduplicado
+
+## 🔗 Dependências
+- [[vw_base_boletos_pagos]]
+- [[vw_base_debito_conta]]
+- [[vw_base_fluxo_apartado]]
+- [[join_pagamentos_multiorigem]]
+- [[regra_deduplicacao_pagamentos]]
+
+## 💻 SQL
+```sql
+-- implementar com base na query principal
+````
+
+## ⚠️ Cuidados
+
+* revisar chave real de dedup
+* validar sobreposição entre fontes
+
+````
+
+---
+
+## `vw_sem_pagamentos_com_desconto`
+
+```markdown
+---
+tipo: modelo
+camada: semantica
+materializacao: view
+tags: [sql, modelo, semantica]
+dominio: cobranca
+---
+
+# 🧱 vw_sem_pagamentos_com_desconto
+
+## 🎯 Objetivo
+Definir o desconto final dos pagamentos elegíveis.
+
+## 🧠 Lógica de negócio
+Usa desconto do boleto quando existir; caso contrário, usa proposta de negócio mais recente.
+
+## 📊 Grão
+evento de pagamento elegível
+
+## 🔗 Dependências
+- [[vw_sem_pagamentos_multiorigem]]
+- [[vw_base_proposta_negocio]]
+- [[join_proposta_negocio_recente]]
+- [[regra_desconto_final]]
+
+## 💻 SQL
+```sql
+-- implementar com base na query principal
+````
+
+## ⚠️ Cuidados
+
+* confirmar se a proposta correta é a mais recente ou a vigente
+
+````
+
+---
+
+## `vw_sem_pagamento_consolidado`
+
+```markdown
+---
+tipo: modelo
+camada: semantica
+materializacao: view
+tags: [sql, modelo, semantica]
+dominio: cobranca
+---
+
+# 🧱 vw_sem_pagamento_consolidado
+
+## 🎯 Objetivo
+Representar o pagamento consolidado já com carteira elegível, desconto, caixa e regul.
+
+## 🧠 Lógica de negócio
+Cruza carteira elegível com pagamentos multiorigem, aplica desconto final e deriva caixa/regul.
+
+## 📊 Grão
+contrato + produto + evento de pagamento elegível
+
+## 🔗 Dependências
+- [[vw_sem_carteira_elegivel_pagamento]]
+- [[vw_sem_pagamentos_multiorigem]]
+- [[vw_sem_pagamentos_com_desconto]]
+- [[regra_calculo_caixa]]
+- [[regra_calculo_regul]]
+
+## 💻 SQL
+```sql
+-- implementar com base na query principal
+````
+
+## ⚠️ Cuidados
+
+* validar se caixa e regul são mutuamente exclusivos
+* revisar se desconto está em decimal
+
+````
+
+---
+
+## `tb_gld_anl_pagadoria_escritorio_mes`
+
+```markdown
+---
+tipo: modelo
+camada: analitica
+materializacao: tabela
+tags: [sql, modelo, analitica]
+dominio: cobranca
+---
+
+# 🧱 tb_gld_anl_pagadoria_escritorio_mes
+
+## 🎯 Objetivo
+Entregar o resultado mensal da pagadoria por escritório, com meta, atingimento, gate e comissão.
+
+## 🧠 Lógica de negócio
+Agrega pagamentos consolidados por escritório, confronta com meta e aplica a faixa de comissionamento.
+
+## 📊 Grão
+competência + escritório
+
+## 🔗 Dependências
+- [[vw_sem_pagamento_consolidado]]
+- [[vw_base_meta_escritorio]]
+- [[vw_base_gate_comissionamento]]
+- [[regra_atingimento_meta]]
+- [[join_gate_comissionamento]]
+
+## 💻 SQL
+```sql
+-- implementar com base na query principal
+````
+
+## ⚠️ Cuidados
+
+* garantir que meta esteja no mesmo grão
+* garantir que faixas de gate não se sobreponham
+
+````
+
+---
+
+# 5. Pipelines iniciais
+
+---
+
+## `pipeline_pagamento_consolidado`
+
+```markdown
+---
+tipo: pipeline
+tags: [pipeline, cobranca, pagamento]
+dominio: cobranca
+---
+
+# 🏗 pipeline_pagamento_consolidado
+
+## 🎯 Objetivo
+Construir o pagamento consolidado elegível da competência.
+
+## 🔄 Fluxo
+1. [[vw_base_carteira_vigor]]
+2. [[vw_base_colchao]]
+3. [[vw_base_vijud_inicio_mes]]
+4. [[vw_sem_carteira_elegivel_pagamento]]
+5. [[vw_base_boletos_pagos]]
+6. [[vw_base_debito_conta]]
+7. [[vw_base_fluxo_apartado]]
+8. [[vw_sem_pagamentos_multiorigem]]
+9. [[vw_base_proposta_negocio]]
+10. [[vw_sem_pagamentos_com_desconto]]
+11. [[vw_sem_pagamento_consolidado]]
+
+## 🧠 Regras principais
+- remover colchão
+- remover vijud início do mês
+- deduplicar multiorigem
+- priorizar desconto do boleto
+- aplicar regra caixa x regul
+
+## ⏱ Frequência
+Diário ou conforme atualização das bases de pagamento
+
+## 📊 Output final
+- [[vw_sem_pagamento_consolidado]]
+````
+
+---
+
+## `pipeline_pagadoria_escritorio_mes`
+
+```markdown
+---
+tipo: pipeline
+tags: [pipeline, cobranca, pagadoria]
+dominio: cobranca
+---
+
+# 🏗 pipeline_pagadoria_escritorio_mes
+
+## 🎯 Objetivo
+Gerar a visão mensal de pagadoria por escritório com meta, atingimento e comissão.
+
+## 🔄 Fluxo
+1. [[vw_sem_pagamento_consolidado]]
+2. [[vw_base_meta_escritorio]]
+3. [[vw_base_gate_comissionamento]]
+4. [[tb_gld_anl_pagadoria_escritorio_mes]]
+
+## 🧠 Regras principais
+- somar caixa
+- somar regul
+- confrontar com meta
+- calcular atingimento
+- aplicar gate e comissão
+
+## ⏱ Frequência
+Mensal ou diária acumulada dentro do mês
+
+## 📊 Output final
+- [[tb_gld_anl_pagadoria_escritorio_mes]]
+```
+
+---
+
+# 6. Como usar isso na prática
+
+## Passo 1
+
+Cole a query inteira numa nota-mãe:
+
+* `query_pagamentos_consolidados_exemplo`
+
+## Passo 2
+
+Crie uma nota para cada bloco reutilizável:
+
+* `regra_calculo_regul`
+* `regra_desconto_final`
+* `join_pagamentos_multiorigem`
+* etc.
+
+## Passo 3
+
+Nos modelos e pipelines, use links:
+
+* `[[regra_calculo_regul]]`
+* `[[join_pagamentos_multiorigem]]`
+
+## Passo 4
+
+Use backlinks do Obsidian para achar:
+
+* quem usa cada regra
+* onde cada join aparece
+* quais pipelines dependem de cada bloco
+
+---
+
+# 7. Regra de ouro para manter encontrável
+
+Use nomes por **intenção**, não por arquivo técnico.
+
+## Bom
+
+* `regra_calculo_regul`
+* `join_pagamentos_multiorigem`
+* `pipeline_pagamento_consolidado`
+
+## Ruim
+
+* `sql_final_versao_7`
+* `query_teste_nova`
+* `tmp_pagamento_ajuste`
+
+---
+
+# 8. O que eu recomendo você fazer agora
+
+Se eu estivesse montando isso com você, a sequência seria:
+
+1. criar a nota índice `biblioteca_sql.md`
+2. criar os templates
+3. criar os 8 blocos reutilizáveis acima
+4. criar os 5 modelos iniciais
+5. colar a query inteira numa nota-mãe
+6. começar a substituir pedaços da query por links conceituais na documentação
+
+A partir daí, seu Obsidian começa a funcionar como:
+
+* biblioteca SQL
+* catálogo de regras
+* lineage mental
+* mini dbt documental
+
+---
+
+Se quiser, no próximo passo eu posso te devolver isso em um **único markdown corrido já pronto para colar no Obsidian**, com separadores, títulos e organização final.
