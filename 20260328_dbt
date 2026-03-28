@@ -1,0 +1,671 @@
+Perfeito. Vou te mostrar um **mini projeto dbt fictício completo** para o seu caso de **pagamentos consolidados**, e logo depois o **equivalente 1:1 em Athena**.
+
+A ideia é você enxergar isto:
+
+* como o dbt organiza
+* como você pode reproduzir no Athena
+* onde entram models, tests, docs e DAG
+* como isso conversa com o padrão que você já vem montando: **base → semântica → analítica**, com regras isoladas e testes acoplados ao processo
+
+---
+
+# 1. Mini projeto dbt fictício
+
+## Estrutura de pastas
+
+```text
+dbt_project/
+├── models/
+│   ├── base/
+│   │   ├── stg_carteira_vigor.sql
+│   │   ├── stg_colchao.sql
+│   │   ├── stg_vijud_inicio_mes.sql
+│   │   ├── stg_boletos_pagos.sql
+│   │   ├── stg_debito_conta.sql
+│   │   ├── stg_fluxo_apartado.sql
+│   │   ├── stg_proposta_negocio.sql
+│   │   ├── stg_meta_escritorio.sql
+│   │   └── stg_gate_comissionamento.sql
+│   │
+│   ├── intermediate/
+│   │   ├── int_carteira_elegivel_pagamento.sql
+│   │   ├── int_pagamentos_multiorigem.sql
+│   │   ├── int_pagamentos_com_desconto.sql
+│   │   └── int_pagamento_consolidado.sql
+│   │
+│   └── marts/
+│       └── mart_pagadoria_escritorio_mes.sql
+│
+├── models/schema.yml
+└── dbt_project.yml
+```
+
+---
+
+## 1.1 `dbt_project.yml`
+
+```yaml
+name: cobranca_pagamentos
+version: 1.0.0
+config-version: 2
+
+profile: cobranca_pagamentos
+
+model-paths: ["models"]
+
+models:
+  cobranca_pagamentos:
+    base:
+      +materialized: view
+    intermediate:
+      +materialized: view
+    marts:
+      +materialized: table
+```
+
+## Leitura prática
+
+* `base` vira `view`
+* `intermediate` vira `view`
+* `marts` vira `table`
+
+Isso é bem coerente com o que você quer fazer no Athena:
+
+* view para esconder complexidade leve
+* tabela para resposta analítica recorrente
+
+---
+
+# 2. Models base
+
+Esses models fazem o papel de **staging/base**.
+
+## 2.1 `stg_boletos_pagos.sql`
+
+```sql
+select
+    dt_ref as p_dt_ref,
+    cast(replace(substr(dt_ref, 1, 7), '-', '') as integer) as mes_ref_yyyymm,
+    cast(replace(dt_ref, '-', '') as integer) as dt_ref_yyyymmdd,
+    contrato,
+    produto,
+    boleto,
+    vl_pago,
+    vl_desconto_boleto,
+    coalesce(flag_cancelado, 0) as flag_cancelado
+from {{ source('cobranca', 'boletos_pagos') }}
+```
+
+## 2.2 `stg_debito_conta.sql`
+
+```sql
+select
+    dt_ref as p_dt_ref,
+    cast(replace(substr(dt_ref, 1, 7), '-', '') as integer) as mes_ref_yyyymm,
+    cast(replace(dt_ref, '-', '') as integer) as dt_ref_yyyymmdd,
+    contrato,
+    produto,
+    dt_pagamento,
+    vl_pago
+from {{ source('cobranca', 'debito_conta') }}
+```
+
+## 2.3 `stg_carteira_vigor.sql`
+
+```sql
+select
+    anomes as p_anomes,
+    contrato,
+    produto,
+    cnpj_raiz,
+    escritorio,
+    fila,
+    cluster_rv,
+    atr_ctr,
+    vl_saldo_gerencial
+from {{ source('cobranca', 'carteira_vigor') }}
+```
+
+---
+
+# 3. Intermediate models
+
+Aqui entra o que você chamaria de **camada semântica/intermediária**.
+
+---
+
+## 3.1 `int_carteira_elegivel_pagamento.sql`
+
+```sql
+with carteira_vigor as (
+    select *
+    from {{ ref('stg_carteira_vigor') }}
+    where p_anomes = 202602
+),
+
+colchao_mes as (
+    select distinct contrato, produto
+    from {{ ref('stg_colchao') }}
+    where p_anomes = 202602
+),
+
+vijud_inicio_mes as (
+    select distinct contrato, produto
+    from {{ ref('stg_vijud_inicio_mes') }}
+    where p_dt_foto = 20260201
+)
+
+select
+    v.*
+from carteira_vigor v
+left join colchao_mes c
+  on v.contrato = c.contrato
+ and v.produto  = c.produto
+left join vijud_inicio_mes j
+  on v.contrato = j.contrato
+ and v.produto  = j.produto
+where c.contrato is null
+  and j.contrato is null
+```
+
+---
+
+## 3.2 `int_pagamentos_multiorigem.sql`
+
+```sql
+with boletos_validos as (
+    select
+        contrato,
+        produto,
+        boleto,
+        dt_ref_yyyymmdd as dt_pagamento,
+        vl_pago,
+        vl_desconto_boleto,
+        'BOLETO' as origem_pagamento
+    from {{ ref('stg_boletos_pagos') }}
+    where dt_ref_yyyymmdd between 20260201 and 20260229
+      and flag_cancelado = 0
+),
+
+debito_conta as (
+    select
+        contrato,
+        produto,
+        cast(null as varchar) as boleto,
+        dt_pagamento,
+        vl_pago,
+        cast(null as decimal(18,4)) as vl_desconto_boleto,
+        'DEBITO_CONTA' as origem_pagamento
+    from {{ ref('stg_debito_conta') }}
+    where dt_ref_yyyymmdd between 20260201 and 20260229
+),
+
+fluxo_apartado as (
+    select
+        contrato,
+        produto,
+        cast(null as varchar) as boleto,
+        dt_pagamento,
+        vl_pago,
+        cast(null as decimal(18,4)) as vl_desconto_boleto,
+        'BACKOFFICE' as origem_pagamento
+    from {{ ref('stg_fluxo_apartado') }}
+    where dt_ref_yyyymmdd between 20260201 and 20260229
+),
+
+pagamentos_brutos as (
+    select * from boletos_validos
+    union all
+    select * from debito_conta
+    union all
+    select * from fluxo_apartado
+),
+
+pagamentos_dedup as (
+    select *
+    from (
+        select
+            p.*,
+            row_number() over (
+                partition by contrato, produto, dt_pagamento, vl_pago
+                order by
+                    case origem_pagamento
+                        when 'BOLETO' then 1
+                        when 'DEBITO_CONTA' then 2
+                        when 'BACKOFFICE' then 3
+                        else 99
+                    end
+            ) as rn
+        from pagamentos_brutos p
+    ) x
+    where rn = 1
+)
+
+select * from pagamentos_dedup
+```
+
+---
+
+## 3.3 `int_pagamentos_com_desconto.sql`
+
+```sql
+with pagamentos as (
+    select *
+    from {{ ref('int_pagamentos_multiorigem') }}
+),
+
+proposta as (
+    select *
+    from (
+        select
+            contrato,
+            produto,
+            boleto,
+            tp_acordo,
+            perc_desconto,
+            row_number() over (
+                partition by contrato, produto, coalesce(boleto, 'SEM_BOLETO')
+                order by dt_referencia desc
+            ) as rn
+        from {{ ref('stg_proposta_negocio') }}
+    ) x
+    where rn = 1
+)
+
+select
+    p.*,
+    pr.tp_acordo,
+    coalesce(
+        p.vl_desconto_boleto,
+        pr.perc_desconto,
+        0
+    ) as perc_desconto_final
+from pagamentos p
+left join proposta pr
+  on p.contrato = pr.contrato
+ and p.produto  = pr.produto
+ and coalesce(p.boleto, 'SEM_BOLETO') = coalesce(pr.boleto, 'SEM_BOLETO')
+```
+
+---
+
+## 3.4 `int_pagamento_consolidado.sql`
+
+```sql
+with carteira as (
+    select *
+    from {{ ref('int_carteira_elegivel_pagamento') }}
+),
+
+pagamentos as (
+    select *
+    from {{ ref('int_pagamentos_com_desconto') }}
+),
+
+joined as (
+    select
+        c.p_anomes,
+        c.contrato,
+        c.produto,
+        c.cnpj_raiz,
+        c.escritorio,
+        c.fila,
+        c.cluster_rv,
+        c.vl_saldo_gerencial,
+        p.boleto,
+        p.dt_pagamento,
+        p.vl_pago,
+        p.origem_pagamento,
+        p.tp_acordo,
+        p.perc_desconto_final
+    from carteira c
+    inner join pagamentos p
+      on c.contrato = p.contrato
+     and c.produto  = p.produto
+)
+
+select
+    *,
+    case
+        when upper(coalesce(tp_acordo, '')) in ('AVISTA', 'A VISTA', 'A_VISTA')
+            then vl_pago
+        else 0
+    end as vl_caixa,
+    case
+        when upper(coalesce(tp_acordo, '')) in ('AVISTA', 'A VISTA', 'A_VISTA')
+            then 0
+        else vl_saldo_gerencial - (vl_saldo_gerencial * perc_desconto_final)
+    end as vl_regul
+from joined
+```
+
+---
+
+# 4. Mart final
+
+## `mart_pagadoria_escritorio_mes.sql`
+
+```sql
+with pagamentos as (
+    select *
+    from {{ ref('int_pagamento_consolidado') }}
+),
+
+resultado_escritorio as (
+    select
+        p_anomes,
+        escritorio,
+        count(distinct contrato) as qtd_contratos_pagantes,
+        sum(vl_caixa) as vl_caixa,
+        sum(vl_regul) as vl_regul
+    from pagamentos
+    group by 1,2
+),
+
+meta as (
+    select *
+    from {{ ref('stg_meta_escritorio') }}
+    where p_anomes = 202602
+),
+
+resultado_meta as (
+    select
+        r.*,
+        m.vl_meta_regul,
+        case
+            when coalesce(m.vl_meta_regul, 0) > 0
+                then r.vl_regul / m.vl_meta_regul
+            else null
+        end as perc_atingimento
+    from resultado_escritorio r
+    left join meta m
+      on r.p_anomes = m.p_anomes
+     and r.escritorio = m.escritorio
+),
+
+gate as (
+    select *
+    from {{ ref('stg_gate_comissionamento') }}
+)
+
+select
+    r.*,
+    g.gate,
+    g.perc_comissao,
+    r.vl_regul * g.perc_comissao as vl_comissao
+from resultado_meta r
+left join gate g
+  on r.escritorio = g.escritorio
+ and r.perc_atingimento >= g.faixa_ini
+ and r.perc_atingimento <  g.faixa_fim
+```
+
+---
+
+# 5. `schema.yml`
+
+Agora entra a parte que, no dbt, fica muito elegante: **testes e docs junto do model**.
+
+```yaml
+version: 2
+
+sources:
+  - name: cobranca
+    tables:
+      - name: boletos_pagos
+      - name: debito_conta
+      - name: fluxo_apartado
+      - name: carteira_vigor
+      - name: colchao
+      - name: vijud_inicio_mes
+      - name: proposta_negocio
+      - name: meta_escritorio
+      - name: gate_comissionamento
+
+models:
+  - name: int_pagamento_consolidado
+    description: Pagamento consolidado elegível com desconto final, caixa e regul
+    columns:
+      - name: contrato
+        data_tests:
+          - not_null
+      - name: produto
+        data_tests:
+          - not_null
+      - name: origem_pagamento
+        data_tests:
+          - not_null
+          - accepted_values:
+              values: ['BOLETO', 'DEBITO_CONTA', 'BACKOFFICE']
+      - name: perc_desconto_final
+        description: Desconto final após priorização do boleto e fallback para proposta
+
+  - name: mart_pagadoria_escritorio_mes
+    description: Resultado mensal da pagadoria por escritório
+    columns:
+      - name: p_anomes
+        data_tests:
+          - not_null
+      - name: escritorio
+        data_tests:
+          - not_null
+      - name: perc_comissao
+        description: Percentual de comissão aplicado via gate
+```
+
+---
+
+# 6. Como isso vira Athena 1:1
+
+Agora o paralelo completo.
+
+---
+
+## dbt `source()`
+
+### dbt
+
+```sql
+from {{ source('cobranca', 'boletos_pagos') }}
+```
+
+### Athena
+
+Você cria:
+
+* `vw_base_boletos_pagos`
+
+ou lê direto:
+
+* `workspace_db.tb_brz_boletos_pagos`
+
+---
+
+## dbt `ref()`
+
+### dbt
+
+```sql
+from {{ ref('int_pagamentos_multiorigem') }}
+```
+
+### Athena
+
+Você usa:
+
+* `workspace_db.vw_sem_pagamentos_multiorigem`
+* ou `workspace_db.tb_slv_can_pagamento_evento`
+
+e a ordem de execução vem do Step Functions.
+
+---
+
+## dbt model
+
+### dbt
+
+`int_pagamento_consolidado.sql`
+
+### Athena
+
+* `vw_sem_pagamento_consolidado`
+  ou
+* `tb_gld_sem_pagamento_consolidado`
+
+---
+
+## dbt tests
+
+### dbt
+
+Declarados em `schema.yml`
+
+### Athena
+
+Viram:
+
+* query SQL de validação
+* insert em `tb_auditoria_testes_dados`
+* possível insert em `tb_auditoria_testes_detalhe`
+
+---
+
+## dbt docs
+
+### dbt
+
+Geradas automaticamente
+
+### Athena
+
+Você substitui por:
+
+* Obsidian
+* notas de modelo
+* notas de regra
+* notas de pipeline
+
+---
+
+## dbt DAG
+
+### dbt
+
+Inferido via `ref()`
+
+### Athena
+
+Você substitui por:
+
+* Step Functions
+* documentação de dependência
+* naming consistente
+
+---
+
+# 7. Estrutura equivalente no seu Athena
+
+```text
+sources/raw:
+- tb_brz_boletos_pagos
+- tb_brz_debito_conta
+- tb_brz_carteira_vigor
+
+base:
+- vw_base_boletos_pagos
+- vw_base_debito_conta
+- vw_base_carteira_vigor
+
+intermediate / semântica:
+- vw_sem_carteira_elegivel_pagamento
+- vw_sem_pagamentos_multiorigem
+- vw_sem_pagamentos_com_desconto
+- tb_gld_sem_pagamento_consolidado
+
+mart analítica:
+- tb_gld_anl_pagadoria_escritorio_mes
+
+tests:
+- tb_auditoria_testes_dados
+- tb_auditoria_testes_detalhe
+
+docs:
+- Obsidian
+
+dag:
+- Step Functions
+```
+
+---
+
+# 8. O clique mais importante
+
+dbt te força a pensar assim:
+
+* isso é fonte?
+* isso é staging?
+* isso é intermediate?
+* isso é mart?
+* isso é teste?
+* isso é documentação?
+
+E isso é exatamente o que você está tentando implantar no Athena.
+
+Então a tradução mais honesta é:
+
+> **você não está “sem dbt”;
+> você está implementando manualmente os princípios que o dbt automatiza.**
+
+---
+
+# 9. Onde o dbt ainda ganharia de você
+
+Mesmo com um desenho muito bom no Athena, o dbt ainda faz algumas coisas melhor por padrão:
+
+* lineage automático via `ref()`
+* docs automáticas
+* testes acoplados ao modelo
+* seleção de execução por grafo
+* padrão único de projeto
+
+Mas conceitualmente, você pode chegar muito perto com:
+
+* Athena
+* Step Functions
+* Obsidian
+* tabelas de auditoria
+* naming e camadas fortes
+
+---
+
+# 10. Resumo final
+
+## dbt real
+
+* source
+* model
+* ref
+* test
+* docs
+* DAG
+
+## Seu Athena equivalente
+
+* base/raw
+* view/tabela modelada
+* dependência documentada
+* query de teste + auditoria
+* Obsidian
+* Step Functions
+
+## Tradução curta
+
+> **dbt é o produto;
+> o que você está montando é a arquitetura mental e operacional do produto.**
+
+Se você quiser, no próximo passo eu posso te devolver isso no formato de **nota mestre para Obsidian**, com:
+
+* projeto dbt fictício
+* equivalente Athena
+* tabela comparativa 1:1
+* e heurísticas de “quando vira base / intermediate / mart”.
