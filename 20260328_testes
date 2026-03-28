@@ -1,0 +1,780 @@
+Perfeito. Vou te entregar um pacote prático em 3 partes:
+
+1. **DDL final das 3 tabelas**
+2. **10 testes Athena prontos**
+3. **esqueleto de Step Functions para modelo + testes + aprovação**
+
+A lógica operacional segue exatamente o que você já vinha construindo: SQL modular por blocos, materialização com CTAS/INSERT INTO quando fizer sentido, e Step Functions chamando Athena com `.sync` para esperar o término da query. O Athena suporta views, EXPLAIN, CTAS e INSERT INTO para ETL  , e o Step Functions suporta `athena:startQueryExecution.sync` para rodar queries de forma síncrona, além de `GetQueryExecution` e `GetQueryResults` em integração com Athena  .
+
+---
+
+# 1. DDL final das 3 tabelas
+
+## 1.1 Tabela de catálogo dos testes
+
+Essa tabela diz **quais testes existem**, para qual modelo, com qual severidade e qual limite tolerado.
+
+```sql
+CREATE TABLE IF NOT EXISTS workspace_db.tb_catalogo_testes_dados (
+    nm_pipeline              varchar,
+    nm_modelo                varchar,
+    nm_teste                 varchar,
+    tp_teste                 varchar,   -- UNICIDADE | NULIDADE | RECONCILIACAO | SANITY_RANGE | etc
+    severidade               varchar,   -- INFO | WARN | ERROR | FATAL
+    vl_limite_erro           bigint,    -- normalmente 0, mas pode haver tolerância
+    fl_ativo                 boolean,
+    regra_versao             varchar,
+    ds_descricao             varchar
+)
+WITH (
+    table_type = 'ICEBERG',
+    format = 'PARQUET',
+    location = 's3://SEU-BUCKET/ctrl/tb_catalogo_testes_dados/'
+);
+```
+
+## 1.2 Tabela resumo da auditoria dos testes
+
+Essa é a principal. Cada linha representa **um teste executado em uma execução**.
+
+```sql
+CREATE TABLE IF NOT EXISTS workspace_db.tb_auditoria_testes_dados (
+    id_execucao              varchar,
+    dt_execucao              timestamp,
+
+    nm_pipeline              varchar,
+    nm_modelo                varchar,
+    nm_teste                 varchar,
+    tp_teste                 varchar,
+
+    severidade               varchar,
+    regra_versao             varchar,
+
+    qtd_erros                bigint,
+    qtd_linhas_avaliadas     bigint,
+    vl_limite_erro           bigint,
+
+    fl_aprovado              boolean,
+    ds_resultado             varchar,
+
+    ds_query_teste           varchar,
+    ds_observacao            varchar
+)
+WITH (
+    table_type = 'ICEBERG',
+    format = 'PARQUET',
+    location = 's3://SEU-BUCKET/ctrl/tb_auditoria_testes_dados/'
+);
+```
+
+## 1.3 Tabela detalhe das falhas
+
+Essa guarda as linhas problemáticas, ou pelo menos a chave do registro ruim.
+
+```sql
+CREATE TABLE IF NOT EXISTS workspace_db.tb_auditoria_testes_detalhe (
+    id_execucao              varchar,
+    dt_execucao              timestamp,
+
+    nm_pipeline              varchar,
+    nm_modelo                varchar,
+    nm_teste                 varchar,
+    tp_teste                 varchar,
+
+    chave_registro           varchar,
+    ds_erro                  varchar,
+    payload_erro             varchar
+)
+WITH (
+    table_type = 'ICEBERG',
+    format = 'PARQUET',
+    location = 's3://SEU-BUCKET/ctrl/tb_auditoria_testes_detalhe/'
+);
+```
+
+---
+
+# 2. Inserts iniciais no catálogo
+
+Vou assumir 2 modelos de exemplo:
+
+* `tb_gld_sem_pagamento_consolidado`
+* `tb_gld_anl_pagadoria_escritorio_mes`
+
+```sql
+INSERT INTO workspace_db.tb_catalogo_testes_dados
+VALUES
+('pipeline_pagamento_consolidado','tb_gld_sem_pagamento_consolidado','teste_unicidade_pagamento_evento','UNICIDADE','FATAL',0,true,'regul_v1','Pagamento evento deve ser único por chave funcional'),
+('pipeline_pagamento_consolidado','tb_gld_sem_pagamento_consolidado','teste_nulidade_chaves_pagamento','NULIDADE','FATAL',0,true,'regul_v1','Contrato, produto e competência não podem ser nulos'),
+('pipeline_pagamento_consolidado','tb_gld_sem_pagamento_consolidado','teste_nulidade_origem_pagamento','NULIDADE','ERROR',0,true,'regul_v1','Origem de pagamento não pode ser nula'),
+('pipeline_pagamento_consolidado','tb_gld_sem_pagamento_consolidado','teste_range_desconto_final','SANITY_RANGE','ERROR',0,true,'regul_v1','Desconto final deve ficar entre 0 e 1'),
+('pipeline_pagamento_consolidado','tb_gld_sem_pagamento_consolidado','teste_regra_caixa_avista','REGRA_NEGOCIO','ERROR',0,true,'regul_v1','À vista deve gerar caixa e não regul'),
+('pipeline_pagamento_consolidado','tb_gld_sem_pagamento_consolidado','teste_regra_regul_parcelado','REGRA_NEGOCIO','ERROR',0,true,'regul_v1','Parcelado não deve gerar caixa positivo'),
+('pipeline_pagamento_consolidado','tb_gld_sem_pagamento_consolidado','teste_reconciliacao_vl_pago_boletos','RECONCILIACAO','WARN',0,true,'regul_v1','Conciliação simples entre boletos válidos e consolidado'),
+('pipeline_pagadoria_escritorio_mes','tb_gld_anl_pagadoria_escritorio_mes','teste_unicidade_pagadoria_escritorio_mes','UNICIDADE','FATAL',0,true,'comissao_v1','Competência + escritório deve ser único'),
+('pipeline_pagadoria_escritorio_mes','tb_gld_anl_pagadoria_escritorio_mes','teste_range_perc_comissao','SANITY_RANGE','ERROR',0,true,'comissao_v1','Percentual de comissão deve ficar entre 0 e 1'),
+('pipeline_pagadoria_escritorio_mes','tb_gld_anl_pagadoria_escritorio_mes','teste_gate_obrigatorio_quando_meta','REGRA_NEGOCIO','ERROR',0,true,'comissao_v1','Se há meta e atingimento, gate deveria existir');
+```
+
+---
+
+# 3. Padrão operacional dos testes
+
+Cada teste segue esta estrutura:
+
+1. query que identifica os erros
+2. `INSERT` na tabela resumo
+3. opcionalmente `INSERT` na tabela detalhe
+
+Para simplificar, vou usar um `id_execucao` fixo de exemplo:
+`exec_202602_001`
+
+No pipeline real, isso deve vir do Step Functions, idealmente de `$$.Execution.Id` ou de um identificador montado na execução .
+
+---
+
+# 4. Os 10 testes Athena prontos
+
+## Teste 1 — unicidade do pagamento evento
+
+### Resumo
+
+```sql
+INSERT INTO workspace_db.tb_auditoria_testes_dados
+SELECT
+    'exec_202602_001' AS id_execucao,
+    current_timestamp AS dt_execucao,
+    'pipeline_pagamento_consolidado' AS nm_pipeline,
+    'tb_gld_sem_pagamento_consolidado' AS nm_modelo,
+    'teste_unicidade_pagamento_evento' AS nm_teste,
+    'UNICIDADE' AS tp_teste,
+    'FATAL' AS severidade,
+    'regul_v1' AS regra_versao,
+    COUNT(*) AS qtd_erros,
+    NULL AS qtd_linhas_avaliadas,
+    0 AS vl_limite_erro,
+    CASE WHEN COUNT(*) = 0 THEN true ELSE false END AS fl_aprovado,
+    CASE
+        WHEN COUNT(*) = 0 THEN 'Nenhuma duplicidade encontrada'
+        ELSE 'Duplicidade encontrada na chave funcional do pagamento'
+    END AS ds_resultado,
+    'teste_unicidade_pagamento_evento.sql' AS ds_query_teste,
+    NULL AS ds_observacao
+FROM (
+    SELECT
+        contrato,
+        produto,
+        dt_pagamento,
+        vl_pago
+    FROM workspace_db.tb_gld_sem_pagamento_consolidado
+    WHERE p_anomes = 202602
+    GROUP BY 1,2,3,4
+    HAVING COUNT(*) > 1
+) t;
+```
+
+### Detalhe
+
+```sql
+INSERT INTO workspace_db.tb_auditoria_testes_detalhe
+SELECT
+    'exec_202602_001',
+    current_timestamp,
+    'pipeline_pagamento_consolidado',
+    'tb_gld_sem_pagamento_consolidado',
+    'teste_unicidade_pagamento_evento',
+    'UNICIDADE',
+    concat(
+        cast(contrato as varchar), '|',
+        cast(produto as varchar), '|',
+        cast(dt_pagamento as varchar), '|',
+        cast(vl_pago as varchar)
+    ) AS chave_registro,
+    'Duplicidade na chave funcional do pagamento',
+    NULL
+FROM (
+    SELECT
+        contrato,
+        produto,
+        dt_pagamento,
+        vl_pago
+    FROM workspace_db.tb_gld_sem_pagamento_consolidado
+    WHERE p_anomes = 202602
+    GROUP BY 1,2,3,4
+    HAVING COUNT(*) > 1
+) t;
+```
+
+---
+
+## Teste 2 — nulidade de chaves críticas
+
+```sql
+INSERT INTO workspace_db.tb_auditoria_testes_dados
+SELECT
+    'exec_202602_001',
+    current_timestamp,
+    'pipeline_pagamento_consolidado',
+    'tb_gld_sem_pagamento_consolidado',
+    'teste_nulidade_chaves_pagamento',
+    'NULIDADE',
+    'FATAL',
+    'regul_v1',
+    COUNT(*) AS qtd_erros,
+    NULL,
+    0,
+    CASE WHEN COUNT(*) = 0 THEN true ELSE false END,
+    CASE
+        WHEN COUNT(*) = 0 THEN 'Sem nulos nas chaves críticas'
+        ELSE 'Existem nulos em p_anomes, contrato ou produto'
+    END,
+    'teste_nulidade_chaves_pagamento.sql',
+    NULL
+FROM workspace_db.tb_gld_sem_pagamento_consolidado
+WHERE p_anomes IS NULL
+   OR contrato IS NULL
+   OR produto IS NULL;
+```
+
+---
+
+## Teste 3 — nulidade de origem de pagamento
+
+```sql
+INSERT INTO workspace_db.tb_auditoria_testes_dados
+SELECT
+    'exec_202602_001',
+    current_timestamp,
+    'pipeline_pagamento_consolidado',
+    'tb_gld_sem_pagamento_consolidado',
+    'teste_nulidade_origem_pagamento',
+    'NULIDADE',
+    'ERROR',
+    'regul_v1',
+    COUNT(*) AS qtd_erros,
+    NULL,
+    0,
+    CASE WHEN COUNT(*) = 0 THEN true ELSE false END,
+    CASE
+        WHEN COUNT(*) = 0 THEN 'Origem de pagamento preenchida em todos os registros'
+        ELSE 'Há registros sem origem de pagamento'
+    END,
+    'teste_nulidade_origem_pagamento.sql',
+    NULL
+FROM workspace_db.tb_gld_sem_pagamento_consolidado
+WHERE origem_pagamento IS NULL;
+```
+
+---
+
+## Teste 4 — range do desconto final
+
+```sql
+INSERT INTO workspace_db.tb_auditoria_testes_dados
+SELECT
+    'exec_202602_001',
+    current_timestamp,
+    'pipeline_pagamento_consolidado',
+    'tb_gld_sem_pagamento_consolidado',
+    'teste_range_desconto_final',
+    'SANITY_RANGE',
+    'ERROR',
+    'regul_v1',
+    COUNT(*) AS qtd_erros,
+    NULL,
+    0,
+    CASE WHEN COUNT(*) = 0 THEN true ELSE false END,
+    CASE
+        WHEN COUNT(*) = 0 THEN 'Desconto final dentro da faixa 0..1'
+        ELSE 'Há desconto final fora da faixa 0..1'
+    END,
+    'teste_range_desconto_final.sql',
+    NULL
+FROM workspace_db.tb_gld_sem_pagamento_consolidado
+WHERE perc_desconto_final < 0
+   OR perc_desconto_final > 1;
+```
+
+---
+
+## Teste 5 — regra de caixa para acordo à vista
+
+```sql
+INSERT INTO workspace_db.tb_auditoria_testes_dados
+SELECT
+    'exec_202602_001',
+    current_timestamp,
+    'pipeline_pagamento_consolidado',
+    'tb_gld_sem_pagamento_consolidado',
+    'teste_regra_caixa_avista',
+    'REGRA_NEGOCIO',
+    'ERROR',
+    'regul_v1',
+    COUNT(*) AS qtd_erros,
+    NULL,
+    0,
+    CASE WHEN COUNT(*) = 0 THEN true ELSE false END,
+    CASE
+        WHEN COUNT(*) = 0 THEN 'Todos os acordos à vista seguem a regra de caixa'
+        ELSE 'Há acordos à vista sem caixa esperado ou com regul indevido'
+    END,
+    'teste_regra_caixa_avista.sql',
+    NULL
+FROM workspace_db.tb_gld_sem_pagamento_consolidado
+WHERE upper(coalesce(tp_acordo, '')) IN ('AVISTA', 'A VISTA', 'A_VISTA')
+  AND (
+        vl_caixa <= 0
+        OR vl_regul <> 0
+      );
+```
+
+---
+
+## Teste 6 — regra de regul para não à vista
+
+```sql
+INSERT INTO workspace_db.tb_auditoria_testes_dados
+SELECT
+    'exec_202602_001',
+    current_timestamp,
+    'pipeline_pagamento_consolidado',
+    'tb_gld_sem_pagamento_consolidado',
+    'teste_regra_regul_parcelado',
+    'REGRA_NEGOCIO',
+    'ERROR',
+    'regul_v1',
+    COUNT(*) AS qtd_erros,
+    NULL,
+    0,
+    CASE WHEN COUNT(*) = 0 THEN true ELSE false END,
+    CASE
+        WHEN COUNT(*) = 0 THEN 'Todos os acordos não à vista seguem a regra de regul'
+        ELSE 'Há acordos não à vista com caixa positivo indevido'
+    END,
+    'teste_regra_regul_parcelado.sql',
+    NULL
+FROM workspace_db.tb_gld_sem_pagamento_consolidado
+WHERE upper(coalesce(tp_acordo, '')) NOT IN ('AVISTA', 'A VISTA', 'A_VISTA')
+  AND vl_caixa > 0;
+```
+
+---
+
+## Teste 7 — reconciliação simples de boletos válidos vs consolidado
+
+Esse teste é simples e serve como alerta. Não precisa bater 100% em todos os cenários, mas ajuda a detectar desvio grande.
+
+```sql
+WITH fonte AS (
+    SELECT
+        SUM(vl_pago) AS total_fonte
+    FROM workspace_db.vw_base_boletos_pagos
+    WHERE dt_ref_yyyymmdd BETWEEN 20260201 AND 20260229
+      AND coalesce(flag_cancelado, 0) = 0
+),
+gold AS (
+    SELECT
+        SUM(vl_pago) AS total_gold
+    FROM workspace_db.tb_gld_sem_pagamento_consolidado
+    WHERE p_anomes = 202602
+      AND origem_pagamento = 'BOLETO'
+)
+INSERT INTO workspace_db.tb_auditoria_testes_dados
+SELECT
+    'exec_202602_001',
+    current_timestamp,
+    'pipeline_pagamento_consolidado',
+    'tb_gld_sem_pagamento_consolidado',
+    'teste_reconciliacao_vl_pago_boletos',
+    'RECONCILIACAO',
+    'WARN',
+    'regul_v1',
+    CASE
+        WHEN coalesce(f.total_fonte,0) = coalesce(g.total_gold,0) THEN 0
+        ELSE 1
+    END AS qtd_erros,
+    NULL,
+    0,
+    CASE
+        WHEN coalesce(f.total_fonte,0) = coalesce(g.total_gold,0) THEN true
+        ELSE false
+    END AS fl_aprovado,
+    concat(
+        'Fonte=', cast(coalesce(f.total_fonte,0) as varchar),
+        ' | Gold=', cast(coalesce(g.total_gold,0) as varchar)
+    ) AS ds_resultado,
+    'teste_reconciliacao_vl_pago_boletos.sql',
+    NULL
+FROM fonte f
+CROSS JOIN gold g;
+```
+
+---
+
+## Teste 8 — unicidade em pagadoria escritório mês
+
+```sql
+INSERT INTO workspace_db.tb_auditoria_testes_dados
+SELECT
+    'exec_202602_001',
+    current_timestamp,
+    'pipeline_pagadoria_escritorio_mes',
+    'tb_gld_anl_pagadoria_escritorio_mes',
+    'teste_unicidade_pagadoria_escritorio_mes',
+    'UNICIDADE',
+    'FATAL',
+    'comissao_v1',
+    COUNT(*) AS qtd_erros,
+    NULL,
+    0,
+    CASE WHEN COUNT(*) = 0 THEN true ELSE false END,
+    CASE
+        WHEN COUNT(*) = 0 THEN 'Chave p_anomes + escritorio está única'
+        ELSE 'Há duplicidade em p_anomes + escritorio'
+    END,
+    'teste_unicidade_pagadoria_escritorio_mes.sql',
+    NULL
+FROM (
+    SELECT
+        p_anomes,
+        escritorio
+    FROM workspace_db.tb_gld_anl_pagadoria_escritorio_mes
+    WHERE p_anomes = 202602
+    GROUP BY 1,2
+    HAVING COUNT(*) > 1
+) t;
+```
+
+---
+
+## Teste 9 — range do percentual de comissão
+
+```sql
+INSERT INTO workspace_db.tb_auditoria_testes_dados
+SELECT
+    'exec_202602_001',
+    current_timestamp,
+    'pipeline_pagadoria_escritorio_mes',
+    'tb_gld_anl_pagadoria_escritorio_mes',
+    'teste_range_perc_comissao',
+    'SANITY_RANGE',
+    'ERROR',
+    'comissao_v1',
+    COUNT(*) AS qtd_erros,
+    NULL,
+    0,
+    CASE WHEN COUNT(*) = 0 THEN true ELSE false END,
+    CASE
+        WHEN COUNT(*) = 0 THEN 'Percentual de comissão dentro da faixa 0..1'
+        ELSE 'Há percentual de comissão fora da faixa 0..1'
+    END,
+    'teste_range_perc_comissao.sql',
+    NULL
+FROM workspace_db.tb_gld_anl_pagadoria_escritorio_mes
+WHERE perc_comissao < 0
+   OR perc_comissao > 1;
+```
+
+---
+
+## Teste 10 — gate obrigatório quando há meta
+
+```sql
+INSERT INTO workspace_db.tb_auditoria_testes_dados
+SELECT
+    'exec_202602_001',
+    current_timestamp,
+    'pipeline_pagadoria_escritorio_mes',
+    'tb_gld_anl_pagadoria_escritorio_mes',
+    'teste_gate_obrigatorio_quando_meta',
+    'REGRA_NEGOCIO',
+    'ERROR',
+    'comissao_v1',
+    COUNT(*) AS qtd_erros,
+    NULL,
+    0,
+    CASE WHEN COUNT(*) = 0 THEN true ELSE false END,
+    CASE
+        WHEN COUNT(*) = 0 THEN 'Todos os registros com meta possuem gate quando aplicável'
+        ELSE 'Há registros com meta/atingimento sem gate definido'
+    END,
+    'teste_gate_obrigatorio_quando_meta.sql',
+    NULL
+FROM workspace_db.tb_gld_anl_pagadoria_escritorio_mes
+WHERE coalesce(vl_meta_regul, 0) > 0
+  AND perc_atingimento IS NOT NULL
+  AND gate IS NULL;
+```
+
+---
+
+# 5. Query de consolidação final da execução
+
+Depois de rodar todos os testes, você precisa consolidar e decidir se o pipeline passa.
+
+```sql
+SELECT
+    id_execucao,
+    COUNT(*) AS qtd_testes,
+    SUM(CASE WHEN fl_aprovado THEN 1 ELSE 0 END) AS qtd_aprovados,
+    SUM(CASE WHEN NOT fl_aprovado THEN 1 ELSE 0 END) AS qtd_reprovados,
+    SUM(CASE WHEN NOT fl_aprovado AND severidade = 'FATAL' THEN 1 ELSE 0 END) AS qtd_fatais,
+    SUM(CASE WHEN NOT fl_aprovado AND severidade = 'ERROR' THEN 1 ELSE 0 END) AS qtd_errors,
+    SUM(CASE WHEN NOT fl_aprovado AND severidade = 'WARN' THEN 1 ELSE 0 END) AS qtd_warns
+FROM workspace_db.tb_auditoria_testes_dados
+WHERE id_execucao = 'exec_202602_001'
+GROUP BY 1;
+```
+
+Regra operacional:
+
+* se `qtd_fatais > 0`, falha o pipeline
+* se `qtd_fatais = 0`, o pipeline pode seguir
+* `WARN` pode só notificar
+
+---
+
+# 6. Esqueleto de Step Functions
+
+O Step Functions suporta `athena:startQueryExecution.sync` e também há exemplos no guia para executar queries em sequência e em paralelo  . Como o limite de payload entre estados é 256 KiB, não carregue resultado gigante entre estados; passe só parâmetros e deixe o Athena gravar no S3/tabelas de controle .
+
+Abaixo vai um esqueleto lógico, em JSON, enxuto.
+
+```json
+{
+  "Comment": "Pipeline de modelo + testes + aprovação",
+  "StartAt": "DefinirContexto",
+  "States": {
+    "DefinirContexto": {
+      "Type": "Pass",
+      "Parameters": {
+        "id_execucao.$": "$$.Execution.Id",
+        "p_anomes.$": "$.p_anomes",
+        "workgroup": "primary",
+        "output_location": "s3://SEU-BUCKET/athena-results/",
+        "database": "workspace_db"
+      },
+      "Next": "RodarModeloPrincipal"
+    },
+
+    "RodarModeloPrincipal": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::athena:startQueryExecution.sync",
+      "Arguments": {
+        "WorkGroup.$": "$.workgroup",
+        "QueryString.$": "$.sql_modelo_principal",
+        "ResultConfiguration": {
+          "OutputLocation.$": "$.output_location"
+        }
+      },
+      "Next": "RodarTestes"
+    },
+
+    "RodarTestes": {
+      "Type": "Parallel",
+      "Branches": [
+        {
+          "StartAt": "Teste1",
+          "States": {
+            "Teste1": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::athena:startQueryExecution.sync",
+              "Arguments": {
+                "WorkGroup.$": "$.workgroup",
+                "QueryString.$": "$.sql_teste_1",
+                "ResultConfiguration": {
+                  "OutputLocation.$": "$.output_location"
+                }
+              },
+              "End": true
+            }
+          }
+        },
+        {
+          "StartAt": "Teste2",
+          "States": {
+            "Teste2": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::athena:startQueryExecution.sync",
+              "Arguments": {
+                "WorkGroup.$": "$.workgroup",
+                "QueryString.$": "$.sql_teste_2",
+                "ResultConfiguration": {
+                  "OutputLocation.$": "$.output_location"
+                }
+              },
+              "End": true
+            }
+          }
+        },
+        {
+          "StartAt": "Teste3",
+          "States": {
+            "Teste3": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::athena:startQueryExecution.sync",
+              "Arguments": {
+                "WorkGroup.$": "$.workgroup",
+                "QueryString.$": "$.sql_teste_3",
+                "ResultConfiguration": {
+                  "OutputLocation.$": "$.output_location"
+                }
+              },
+              "End": true
+            }
+          }
+        }
+      ],
+      "Next": "ConsolidarResultadoDosTestes"
+    },
+
+    "ConsolidarResultadoDosTestes": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::athena:startQueryExecution.sync",
+      "Arguments": {
+        "WorkGroup.$": "$.workgroup",
+        "QueryString.$": "$.sql_consolidacao_testes",
+        "ResultConfiguration": {
+          "OutputLocation.$": "$.output_location"
+        }
+      },
+      "Next": "AvaliarExecucao"
+    },
+
+    "AvaliarExecucao": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Variable": "$.qtd_fatais",
+          "NumericGreaterThan": 0,
+          "Next": "FalharExecucao"
+        }
+      ],
+      "Default": "PublicarProximaEtapa"
+    },
+
+    "PublicarProximaEtapa": {
+      "Type": "Succeed"
+    },
+
+    "FalharExecucao": {
+      "Type": "Fail",
+      "Cause": "Existem testes FATAL reprovados"
+    }
+  }
+}
+```
+
+## Observação importante
+
+No mundo real, a parte `AvaliarExecucao` precisa de um jeito de trazer o resultado agregado para o estado. Há 2 caminhos práticos:
+
+1. usar `GetQueryResults` depois da query de consolidação, se o resultado for pequeno
+2. mais simples e robusto: gravar a consolidação numa tabela e fazer uma query final pequena que retorne só `qtd_fatais`
+
+Como Step Functions e Athena já expõem `GetQueryResults`, isso é viável no fluxo quando o resultado é pequeno .
+
+---
+
+# 7. Ordem prática de implantação
+
+Eu faria exatamente nesta ordem:
+
+## Semana 1
+
+Crie:
+
+* `tb_catalogo_testes_dados`
+* `tb_auditoria_testes_dados`
+* `tb_auditoria_testes_detalhe`
+
+Depois cadastre os 10 testes.
+
+## Semana 2
+
+Implemente só 3 testes:
+
+* unicidade pagamento evento
+* nulidade chaves
+* range de perc_comissao
+
+Rode manualmente no Athena.
+
+## Semana 3
+
+Implemente os outros 7 e valide os inserts na tabela de auditoria.
+
+## Semana 4
+
+Integre 1 pipeline piloto no Step Functions usando `athena:startQueryExecution.sync` .
+
+## Semana 5
+
+Crie a query de consolidação final e a regra de bloqueio por `FATAL`.
+
+## Semana 6
+
+Monte um painel simples em QuickSight ou Athena para ver:
+
+* testes por execução
+* falhas por modelo
+* falhas por severidade
+
+---
+
+# 8. O que eu faria como “mínimo viável” para você
+
+Se você quiser começar sem se afogar:
+
+1. crie as 3 tabelas
+2. implemente 4 testes:
+
+   * unicidade pagamento evento
+   * nulidade chaves
+   * range de desconto final
+   * range de perc_comissao
+3. rode tudo manualmente por 1 ou 2 competências
+4. depois pluge no Step Functions
+
+Isso já te dá um sistema real.
+
+---
+
+# 9. Dicas de operação
+
+A mais importante:
+
+> **não tente começar cobrindo tudo; comece cobrindo o que quebraria confiança no número.**
+
+No seu caso, isso significa:
+
+* duplicidade
+* nulidade crítica
+* regra financeira absurda
+* comissão fora da faixa
+* ausência de gate quando deveria existir
+
+---
+
+# 10. Fechamento
+
+Com esse pacote, você já tem o esqueleto completo de um **framework de testes de dados no Athena**:
+
+* catálogo
+* resumo
+* detalhe
+* testes específicos
+* testes genéricos
+* bloqueio por severidade
+* integração com Step Functions
+
+E isso fica muito alinhado com a filosofia que você vem montando:
+**query modular para pensar, tabela para persistir, teste para confiar, pipeline para operar.**
+
+No próximo passo, eu posso te devolver isso em formato de **nota markdown pronta para Obsidian**, ou transformar esse fluxo num **framework SQL parametrizado** em que você só troca:
+
+* nome do modelo
+* filtro
+* chave
+* severidade
+* descrição do teste.
