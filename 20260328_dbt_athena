@@ -1,0 +1,340 @@
+Perfeito — vamos transformar tudo isso em um **framework reutilizável**, no estilo que você pode:
+
+* colar no **Obsidian**
+* aplicar em QUALQUER pipeline
+* usar como padrão no trabalho
+* escalar com consistência (nível “dbt mental”)
+
+---
+
+# 🧠 FRAMEWORK — **Athena Analytics Engineering (AAE)**
+
+> Um sistema para construir pipelines confiáveis em Athena sem dbt
+
+---
+
+# 🧱 1. PRINCÍPIOS (imutáveis)
+
+```text
+1. Toda lógica vira ativo reutilizável (view ou tabela)
+2. Toda camada tem responsabilidade única
+3. Toda regra de negócio é explícita e documentada
+4. Toda saída importante tem teste
+5. Toda query longa é modular
+6. Nenhuma regra crítica vive só em dashboard
+```
+
+---
+
+# 🧭 2. CAMADAS (padrão oficial)
+
+```text
+BRONZE (raw)
+→ dados crus por origem
+
+SILVER_BASE (padronização)
+→ tipos, nomes, datas, chaves
+
+SILVER_CANONICA (integração)
+→ dedup, união de fontes, consistência
+
+GOLD_SEMANTICA (negócio)
+→ entidades estáveis (pagamento, carteira, regul)
+
+GOLD_ANALITICA (consumo)
+→ agregações e datasets finais
+
+SEMANTIC_LAYER (BI)
+→ nomes e métricas de negócio
+```
+
+---
+
+# 🧩 3. TEMPLATE DE MODEL (SQL)
+
+```sql
+-- ============================================
+-- 📌 MODEL: vw_sem_pagamento_consolidado
+-- 🎯 OBJETIVO: consolidar pagamentos elegíveis
+-- ============================================
+
+WITH params AS (
+    SELECT
+        202602 AS p_anomes,
+        20260201 AS p_dt_ini,
+        20260229 AS p_dt_fim
+),
+
+-- 1. CARTEIRA
+carteira AS (
+    SELECT *
+    FROM vw_sem_carteira_elegivel
+),
+
+-- 2. PAGAMENTOS
+pagamentos AS (
+    SELECT *
+    FROM vw_sem_pagamentos_multiorigem
+),
+
+-- 3. DESCONTO
+desconto AS (
+    SELECT *
+    FROM vw_sem_pagamentos_com_desconto
+),
+
+-- 4. JOIN FINAL
+joined AS (
+    SELECT
+        c.*,
+        p.vl_pago,
+        d.perc_desconto_final
+    FROM carteira c
+    JOIN pagamentos p
+        ON ...
+)
+
+-- 5. REGRA FINAL
+SELECT
+    *,
+    CASE
+        WHEN tp_acordo = 'A_VISTA' THEN vl_pago
+        ELSE 0
+    END AS vl_caixa,
+
+    CASE
+        WHEN tp_acordo = 'A_VISTA' THEN 0
+        ELSE vl_saldo_gerencial - (vl_saldo_gerencial * perc_desconto_final)
+    END AS vl_regul
+FROM joined
+```
+
+---
+
+# 🧱 4. PADRÃO DE NOMES
+
+```text
+vw_base_*     → staging / padronização
+vw_sem_*      → lógica de negócio reutilizável
+tb_gld_sem_*  → entidade materializada
+tb_gld_anl_*  → dataset analítico
+vw_qs_*       → camada BI
+```
+
+---
+
+# 🔁 5. DECISÃO: VIEW vs TABLE
+
+```text
+SE:
+- lógica leve
+- pouco reuso
+- baixo custo
+
+→ VIEW
+
+SE:
+- custo alto
+- reuso alto
+- base para dashboard
+
+→ TABLE (Iceberg)
+```
+
+---
+
+# 🧪 6. FRAMEWORK DE TESTES
+
+## 🎯 Tabela padrão
+
+```sql
+CREATE TABLE tb_auditoria_testes_dados (
+    nm_teste varchar,
+    nm_modelo varchar,
+    tp_teste varchar,
+    qtd_erros bigint,
+    fl_aprovado boolean,
+    severidade varchar,
+    dt_execucao timestamp,
+    id_execucao varchar
+);
+```
+
+---
+
+## 🧪 Tipos de teste
+
+```text
+NOT_NULL
+DUPLICIDADE
+RANGE
+ACEITOS (domínio)
+RECONCILIAÇÃO
+```
+
+---
+
+## 🔥 Severidade
+
+```text
+FATAL → quebra pipeline
+ERROR → alerta + possível bloqueio
+WARN  → log apenas
+```
+
+---
+
+# ⚙️ 7. PIPELINE (Step Functions)
+
+```text
+1. Executar BASE
+2. Executar SEMÂNTICA
+3. Executar GOLD
+4. Executar TESTES
+5. Avaliar severidade
+6. Publicar (QuickSight)
+```
+
+---
+
+# 🧠 8. PADRÃO DE DOCUMENTAÇÃO (Obsidian)
+
+```markdown
+# vw_sem_pagamento_consolidado
+
+## 🎯 Objetivo
+Consolidar pagamentos elegíveis
+
+## 📊 Grão
+contrato + produto + pagamento
+
+## 🔗 Dependências
+- vw_sem_carteira_elegivel
+- vw_sem_pagamentos_multiorigem
+
+## 🧠 Regras
+- exclui colchão
+- exclui vijud início do mês
+- prioriza desconto do boleto
+
+## 🧪 Testes
+- not null contrato
+- duplicidade contrato+produto+pagamento
+
+## 📊 Consumo
+- tb_gld_anl_pagadoria_escritorio_mes
+- QuickSight
+```
+
+---
+
+# 🧩 9. BIBLIOTECA DE BLOCOS SQL
+
+## 📌 JOIN padrão seguro
+
+```sql
+ON a.contrato = b.contrato
+AND a.produto  = b.produto
+```
+
+---
+
+## 📌 Deduplicação
+
+```sql
+row_number() over (
+    partition by contrato, produto
+    order by dt_referencia desc
+)
+```
+
+---
+
+## 📌 Fallback
+
+```sql
+coalesce(valor_boleto, valor_proposta, 0)
+```
+
+---
+
+## 📌 Regra de negócio
+
+```sql
+case
+    when tp_acordo = 'A_VISTA' then valor
+    else calculo
+end
+```
+
+---
+
+# 🧭 10. CHECKLIST DE QUALIDADE (estilo code review)
+
+```text
+[ ] Tem grão definido?
+[ ] Tem filtro de partição?
+[ ] Evita SELECT *?
+[ ] Usa CTE modular?
+[ ] Tem teste associado?
+[ ] Nome segue padrão?
+[ ] Pode ser reutilizado?
+```
+
+---
+
+# 🧠 11. VERSIONAMENTO DE REGRA
+
+```text
+versao_regra: v1, v2, v3
+origem_regra: proposta / boleto / fallback
+motivo: mudança de regra de negócio
+```
+
+---
+
+# 🔄 12. CICLO DE VIDA DO DADO
+
+```text
+RAW → BASE → CANONICA → SEMANTICA → ANALITICA → BI
+```
+
+---
+
+# 🚀 13. COMO USAR ESSE FRAMEWORK
+
+## Para cada nova análise:
+
+1. Defina o **grão**
+2. Crie base (`vw_base_*`)
+3. Crie integração (`vw_sem_*`)
+4. Crie entidade (`tb_gld_sem_*`)
+5. Crie analítico (`tb_gld_anl_*`)
+6. Crie testes
+7. Documente
+8. Orquestre
+
+---
+
+# 🔥 14. FRASE-CHAVE DO FRAMEWORK
+
+> **“Se a lógica apareceu 2 vezes, ela vira view.
+> Se virou crítica, vira tabela.
+> Se virou tabela, precisa de teste.”**
+
+---
+
+# 🧩 15. O QUE ISSO TE TORNA
+
+Se você seguir isso:
+
+* você não escreve query → você **projeta sistemas**
+* você não corrige bug → você **define contrato de dados**
+* você não faz dashboard → você **define semântica de negócio**
+
+---
+
+Se quiser, no próximo passo posso:
+
+👉 transformar isso em **template pronto de vault no Obsidian (com pastas + notas + exemplos preenchidos)**
+👉 ou montar um **pipeline real seu 100% dentro desse framework (end-to-end Athena + Step Functions)**
