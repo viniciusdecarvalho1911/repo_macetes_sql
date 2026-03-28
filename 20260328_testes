@@ -778,3 +778,736 @@ No próximo passo, eu posso te devolver isso em formato de **nota markdown pront
 * chave
 * severidade
 * descrição do teste.
+----------
+
+Perfeito. Vou te passar um **passo a passo operacional de implantação**, pensado para alguém **júnior/pleno**, do zero, no seu stack:
+
+* **Athena**
+* **S3**
+* **Glue Catalog**
+* **Step Functions**
+* **Iceberg** para tabelas de controle/auditoria
+
+A ideia é sair de:
+
+> “eu tenho alguns testes SQL”
+
+para:
+
+> “eu tenho um sistema de testes com histórico, aprovação, detalhe de falha e uso no pipeline”
+
+O desenho conversa muito bem com o que você já está construindo:
+
+* SQL modular em blocos (`parametros`, `base`, `satélites`, `regras`, `agregação`)
+* materialização controlada em Iceberg + Athena + Step Functions, sem depender de materialized view do Glue
+* CTAS para carga inicial e `INSERT INTO` para incrementais/ETL no Athena
+* integração nativa do Step Functions com Athena via `StartQueryExecution` e padrão `.sync` 
+
+---
+
+# Visão geral do sistema
+
+Você vai implantar **3 coisas**:
+
+## 1. tabela resumo de testes
+
+Guarda o resultado agregado de cada teste executado.
+
+## 2. tabela detalhe de falhas
+
+Guarda as linhas problemáticas ou, pelo menos, as chaves problemáticas.
+
+## 3. processo operacional
+
+Um fluxo que:
+
+* roda o modelo
+* roda os testes
+* grava o resultado
+* decide se aprova ou reprova a execução
+
+---
+
+# Objetivo prático
+
+Ao final, você conseguirá responder perguntas como:
+
+* quais testes rodaram hoje?
+* quais falharam?
+* quais falhas são fatais?
+* esse pipeline pode seguir?
+* qual modelo tem mais problema?
+* isso piorou em relação à execução anterior?
+
+---
+
+# Estratégia de implantação
+
+Eu dividiria em **8 etapas**.
+
+---
+
+# Etapa 1 — definir o objetivo e o escopo
+
+Antes de criar qualquer tabela, defina:
+
+## 1.1 Quais modelos serão testados primeiro
+
+Não tente testar tudo de uma vez.
+
+Escolha **1 pipeline piloto**, por exemplo:
+
+* `tb_gld_sem_pagamento_consolidado`
+* `tb_gld_anl_pagadoria_escritorio_mes`
+
+## 1.2 Quais testes entram na primeira versão
+
+Comece com os testes mais fortes e mais simples:
+
+* unicidade
+* nulidade
+* duplicidade funcional
+* sanity range
+* reconciliação simples
+
+## 1.3 O que bloqueia pipeline e o que só alerta
+
+Defina desde o começo:
+
+### bloqueia
+
+* chave duplicada
+* nulo em chave crítica
+* comissão fora de faixa absurda
+
+### alerta
+
+* volume caiu 10%
+* meta ausente em poucos casos
+* queda fora do padrão
+
+Isso evita que você transforme qualquer desvio pequeno em crise.
+
+---
+
+# Etapa 2 — criar as tabelas de auditoria
+
+Eu recomendo começar com **2 tabelas**:
+
+## 2.1 Tabela resumo
+
+Guarda 1 linha por teste executado.
+
+## 2.2 Tabela detalhe
+
+Guarda as linhas com falha.
+
+Como você está no stack Athena/Iceberg, eu prefiro Iceberg porque você vai inserir continuamente, pode evoluir schema e quer histórico operacional consistente. Esse tipo de uso combina bem com o padrão que você já vem desenhando para camadas `ctrl` em Iceberg .
+
+---
+
+## 2.1 DDL da tabela resumo
+
+```sql
+CREATE TABLE IF NOT EXISTS workspace_db.tb_auditoria_testes_dados (
+    id_execucao              varchar,
+    dt_execucao              timestamp,
+
+    nm_pipeline              varchar,
+    nm_modelo                varchar,
+    nm_teste                 varchar,
+    tp_teste                 varchar,
+
+    severidade               varchar,   -- INFO | WARN | ERROR | FATAL
+    regra_versao             varchar,
+
+    qtd_erros                bigint,
+    qtd_linhas_avaliadas     bigint,
+    vl_limite_erro           bigint,
+
+    fl_aprovado              boolean,
+    ds_resultado             varchar,
+
+    ds_query_teste           varchar,
+    ds_observacao            varchar
+)
+WITH (
+    table_type = 'ICEBERG',
+    format = 'PARQUET',
+    location = 's3://SEU-BUCKET/ctrl/tb_auditoria_testes_dados/'
+);
+```
+
+---
+
+## 2.2 DDL da tabela detalhe
+
+```sql
+CREATE TABLE IF NOT EXISTS workspace_db.tb_auditoria_testes_detalhe (
+    id_execucao              varchar,
+    dt_execucao              timestamp,
+
+    nm_pipeline              varchar,
+    nm_modelo                varchar,
+    nm_teste                 varchar,
+    tp_teste                 varchar,
+
+    chave_registro           varchar,
+    ds_erro                  varchar,
+    payload_erro             varchar
+)
+WITH (
+    table_type = 'ICEBERG',
+    format = 'PARQUET',
+    location = 's3://SEU-BUCKET/ctrl/tb_auditoria_testes_detalhe/'
+);
+```
+
+---
+
+# Etapa 3 — definir o catálogo de testes
+
+Agora você precisa decidir **quais testes existem**.
+
+Eu sugiro manter uma tabelinha de catálogo, opcional mas muito útil, com:
+
+* nome do teste
+* modelo alvo
+* tipo
+* severidade
+* limite tolerado
+* ativo/inativo
+
+## 3.1 DDL do catálogo de testes
+
+```sql
+CREATE TABLE IF NOT EXISTS workspace_db.tb_catalogo_testes_dados (
+    nm_pipeline              varchar,
+    nm_modelo                varchar,
+    nm_teste                 varchar,
+    tp_teste                 varchar,
+    severidade               varchar,
+    vl_limite_erro           bigint,
+    fl_ativo                 boolean,
+    regra_versao             varchar,
+    ds_descricao             varchar
+)
+WITH (
+    table_type = 'ICEBERG',
+    format = 'PARQUET',
+    location = 's3://SEU-BUCKET/ctrl/tb_catalogo_testes_dados/'
+);
+```
+
+---
+
+## 3.2 Exemplo de inserts no catálogo
+
+```sql
+INSERT INTO workspace_db.tb_catalogo_testes_dados
+VALUES
+('pipeline_pagamento_consolidado', 'tb_gld_sem_pagamento_consolidado', 'teste_unicidade_pagamento_evento', 'UNICIDADE', 'FATAL', 0, true, 'regul_v1', 'Pagamento evento deve ser único por chave funcional'),
+('pipeline_pagamento_consolidado', 'tb_gld_sem_pagamento_consolidado', 'teste_nulidade_contrato_produto', 'NULIDADE', 'FATAL', 0, true, 'regul_v1', 'Contrato e produto não podem ser nulos'),
+('pipeline_pagamento_consolidado', 'tb_gld_sem_pagamento_consolidado', 'teste_range_perc_comissao', 'SANITY_RANGE', 'ERROR', 0, true, 'regul_v1', 'Percentual de comissão deve ficar entre 0 e 1');
+```
+
+---
+
+# Etapa 4 — criar os testes específicos
+
+Aqui entra o coração da implantação.
+
+Cada teste vai ter 3 partes:
+
+## Parte A
+
+A query que identifica erro.
+
+## Parte B
+
+A query que grava o resumo.
+
+## Parte C
+
+Opcionalmente, a query que grava o detalhe.
+
+---
+
+# Etapa 5 — começar pelos testes específicos
+
+Comece pelos testes **mais próximos do modelo de negócio**.
+
+No seu pipeline de pagamentos consolidados, eu começaria assim.
+
+---
+
+## Teste 1 — unicidade da chave funcional do pagamento
+
+### Objetivo
+
+Garantir que o mesmo pagamento não apareça mais de uma vez após a consolidação.
+
+### Query de erro
+
+```sql
+SELECT
+    contrato,
+    produto,
+    dt_pagamento,
+    vl_pago,
+    COUNT(*) AS qtd
+FROM workspace_db.tb_gld_sem_pagamento_consolidado
+WHERE p_anomes = 202602
+GROUP BY 1,2,3,4
+HAVING COUNT(*) > 1;
+```
+
+### Query de gravação do resumo
+
+```sql
+INSERT INTO workspace_db.tb_auditoria_testes_dados
+SELECT
+    'exec_202602_001'                                   AS id_execucao,
+    current_timestamp                                   AS dt_execucao,
+    'pipeline_pagamento_consolidado'                    AS nm_pipeline,
+    'tb_gld_sem_pagamento_consolidado'                  AS nm_modelo,
+    'teste_unicidade_pagamento_evento'                  AS nm_teste,
+    'UNICIDADE'                                         AS tp_teste,
+    'FATAL'                                             AS severidade,
+    'regul_v1'                                          AS regra_versao,
+    COUNT(*)                                            AS qtd_erros,
+    NULL                                                AS qtd_linhas_avaliadas,
+    0                                                   AS vl_limite_erro,
+    CASE WHEN COUNT(*) = 0 THEN true ELSE false END     AS fl_aprovado,
+    CASE
+        WHEN COUNT(*) = 0 THEN 'Nenhuma duplicidade encontrada'
+        ELSE 'Duplicidade encontrada na chave funcional do pagamento'
+    END                                                 AS ds_resultado,
+    'teste_unicidade_pagamento_evento.sql'              AS ds_query_teste,
+    NULL                                                AS ds_observacao
+FROM (
+    SELECT
+        contrato,
+        produto,
+        dt_pagamento,
+        vl_pago
+    FROM workspace_db.tb_gld_sem_pagamento_consolidado
+    WHERE p_anomes = 202602
+    GROUP BY 1,2,3,4
+    HAVING COUNT(*) > 1
+) t;
+```
+
+### Query de detalhe
+
+```sql
+INSERT INTO workspace_db.tb_auditoria_testes_detalhe
+SELECT
+    'exec_202602_001'                                   AS id_execucao,
+    current_timestamp                                   AS dt_execucao,
+    'pipeline_pagamento_consolidado'                    AS nm_pipeline,
+    'tb_gld_sem_pagamento_consolidado'                  AS nm_modelo,
+    'teste_unicidade_pagamento_evento'                  AS nm_teste,
+    'UNICIDADE'                                         AS tp_teste,
+    concat(
+        cast(contrato as varchar), '|',
+        cast(produto as varchar), '|',
+        cast(dt_pagamento as varchar), '|',
+        cast(vl_pago as varchar)
+    )                                                   AS chave_registro,
+    'Duplicidade na chave funcional do pagamento'       AS ds_erro,
+    NULL                                                AS payload_erro
+FROM (
+    SELECT
+        contrato,
+        produto,
+        dt_pagamento,
+        vl_pago
+    FROM workspace_db.tb_gld_sem_pagamento_consolidado
+    WHERE p_anomes = 202602
+    GROUP BY 1,2,3,4
+    HAVING COUNT(*) > 1
+) t;
+```
+
+---
+
+## Teste 2 — nulidade em campos obrigatórios
+
+### Objetivo
+
+Garantir que contrato, produto e competência não estejam nulos.
+
+### Query de erro
+
+```sql
+SELECT *
+FROM workspace_db.tb_gld_sem_pagamento_consolidado
+WHERE p_anomes IS NULL
+   OR contrato IS NULL
+   OR produto IS NULL;
+```
+
+### Resumo
+
+```sql
+INSERT INTO workspace_db.tb_auditoria_testes_dados
+SELECT
+    'exec_202602_001',
+    current_timestamp,
+    'pipeline_pagamento_consolidado',
+    'tb_gld_sem_pagamento_consolidado',
+    'teste_nulidade_contrato_produto',
+    'NULIDADE',
+    'FATAL',
+    'regul_v1',
+    COUNT(*) AS qtd_erros,
+    NULL,
+    0,
+    CASE WHEN COUNT(*) = 0 THEN true ELSE false END,
+    CASE
+        WHEN COUNT(*) = 0 THEN 'Nenhum nulo em campos obrigatórios'
+        ELSE 'Foram encontrados nulos em campos obrigatórios'
+    END,
+    'teste_nulidade_contrato_produto.sql',
+    NULL
+FROM workspace_db.tb_gld_sem_pagamento_consolidado
+WHERE p_anomes IS NULL
+   OR contrato IS NULL
+   OR produto IS NULL;
+```
+
+---
+
+## Teste 3 — sanity range de percentual
+
+### Objetivo
+
+Garantir que `perc_comissao` fique entre 0 e 1.
+
+```sql
+INSERT INTO workspace_db.tb_auditoria_testes_dados
+SELECT
+    'exec_202602_001',
+    current_timestamp,
+    'pipeline_pagadoria_escritorio_mes',
+    'tb_gld_anl_pagadoria_escritorio_mes',
+    'teste_range_perc_comissao',
+    'SANITY_RANGE',
+    'ERROR',
+    'comissao_v1',
+    COUNT(*) AS qtd_erros,
+    NULL,
+    0,
+    CASE WHEN COUNT(*) = 0 THEN true ELSE false END,
+    CASE
+        WHEN COUNT(*) = 0 THEN 'Todos os percentuais de comissão estão dentro da faixa'
+        ELSE 'Existem percentuais de comissão fora da faixa 0..1'
+    END,
+    'teste_range_perc_comissao.sql',
+    NULL
+FROM workspace_db.tb_gld_anl_pagadoria_escritorio_mes
+WHERE perc_comissao < 0
+   OR perc_comissao > 1;
+```
+
+---
+
+## Teste 4 — reconciliação simples
+
+### Objetivo
+
+Comparar total de `vl_pago` entre a fonte consolidada e o gold.
+
+```sql
+WITH fonte AS (
+    SELECT SUM(vl_pago) AS total_fonte
+    FROM workspace_db.vw_base_boletos_pagos
+    WHERE dt_ref_yyyymmdd BETWEEN 20260201 AND 20260229
+      AND COALESCE(flag_cancelado, 0) = 0
+),
+gold AS (
+    SELECT SUM(vl_pago) AS total_gold
+    FROM workspace_db.tb_gld_sem_pagamento_consolidado
+    WHERE p_anomes = 202602
+)
+INSERT INTO workspace_db.tb_auditoria_testes_dados
+SELECT
+    'exec_202602_001',
+    current_timestamp,
+    'pipeline_pagamento_consolidado',
+    'tb_gld_sem_pagamento_consolidado',
+    'teste_reconciliacao_vl_pago',
+    'RECONCILIACAO',
+    'WARN',
+    'regul_v1',
+    CASE WHEN abs(coalesce(f.total_fonte,0) - coalesce(g.total_gold,0)) = 0 THEN 0 ELSE 1 END AS qtd_erros,
+    NULL,
+    0,
+    CASE WHEN abs(coalesce(f.total_fonte,0) - coalesce(g.total_gold,0)) = 0 THEN true ELSE false END,
+    concat(
+        'Fonte=', cast(coalesce(f.total_fonte,0) as varchar),
+        ' | Gold=', cast(coalesce(g.total_gold,0) as varchar)
+    ),
+    'teste_reconciliacao_vl_pago.sql',
+    NULL
+FROM fonte f
+CROSS JOIN gold g;
+```
+
+---
+
+# Etapa 6 — depois criar os testes genéricos
+
+Agora você entra na camada “framework”.
+
+Esses testes podem ser reaproveitados em vários modelos.
+
+---
+
+## 6.1 Testes genéricos que eu implantaria primeiro
+
+### Genéricos universais
+
+* unicidade por chave
+* nulidade por coluna obrigatória
+* range numérico
+* domínio permitido
+* integridade referencial
+
+### Genéricos analíticos
+
+* reconciliação de soma
+* volume mínimo
+* comparação com execução anterior
+* percentual de nulos
+* partição obrigatória carregada
+
+---
+
+## 6.2 Como transformar teste em template
+
+Crie notas ou arquivos template com placeholders:
+
+### Template de unicidade
+
+```sql
+SELECT
+    <chaves>,
+    COUNT(*) AS qtd
+FROM <tabela>
+WHERE <filtro>
+GROUP BY <chaves>
+HAVING COUNT(*) > 1;
+```
+
+### Template de nulidade
+
+```sql
+SELECT *
+FROM <tabela>
+WHERE <coluna_1> IS NULL
+   OR <coluna_2> IS NULL;
+```
+
+### Template de domínio
+
+```sql
+SELECT *
+FROM <tabela>
+WHERE <coluna> NOT IN (<lista_valores>);
+```
+
+### Template de range
+
+```sql
+SELECT *
+FROM <tabela>
+WHERE <coluna> < <minimo>
+   OR <coluna> > <maximo>;
+```
+
+---
+
+# Etapa 7 — operacionalizar com Step Functions
+
+Aqui entra a parte de produção.
+
+A documentação do Step Functions mostra integração direta com Athena via `StartQueryExecution` e padrão `.sync`, que é exatamente o que você quer quando precisa esperar a query terminar antes de seguir .
+
+---
+
+## 7.1 Fluxo lógico do pipeline com testes
+
+```text
+1. Registrar início da execução
+2. Rodar modelo principal
+3. Rodar teste 1
+4. Rodar teste 2
+5. Rodar teste 3
+6. Rodar teste 4
+7. Consolidar resultados
+8. Verificar se existe falha FATAL
+9. Se sim -> encerrar como falha
+10. Se não -> seguir para próxima etapa / publicar
+11. Registrar fim
+```
+
+---
+
+## 7.2 Como fazer o controle por `id_execucao`
+
+Cada execução do pipeline precisa ter um identificador.
+
+Exemplo:
+
+* `exec_202602_001`
+* ou o próprio `$$.Execution.Id` do Step Functions
+
+Esse `id_execucao` deve ser passado para:
+
+* o modelo
+* os testes
+* a tabela resumo
+* a tabela detalhe
+
+Assim você consegue rastrear tudo que aconteceu naquela execução.
+
+---
+
+## 7.3 Query de consolidação final dos testes
+
+```sql
+SELECT
+    id_execucao,
+    COUNT(*) AS qtd_testes,
+    SUM(CASE WHEN fl_aprovado THEN 1 ELSE 0 END) AS qtd_aprovados,
+    SUM(CASE WHEN NOT fl_aprovado THEN 1 ELSE 0 END) AS qtd_reprovados,
+    SUM(CASE WHEN NOT fl_aprovado AND severidade = 'FATAL' THEN 1 ELSE 0 END) AS qtd_fatais
+FROM workspace_db.tb_auditoria_testes_dados
+WHERE id_execucao = 'exec_202602_001'
+GROUP BY 1;
+```
+
+Regra:
+
+* se `qtd_fatais > 0`, o pipeline falha.
+
+---
+
+# Etapa 8 — criar um painel e rotina de operação
+
+Depois que a tabela estiver populando, faça um painel simples no QuickSight ou até consultas Athena com:
+
+* testes por dia
+* falhas por severidade
+* falhas por modelo
+* top testes que mais falham
+* tendência de `qtd_erros`
+
+Isso ajuda muito a transformar qualidade em algo visível, e não “algo que alguém olha quando dá problema”.
+
+---
+
+# Ordem de implantação recomendada
+
+Para um júnior/pleno, eu faria nesta ordem:
+
+## Semana 1
+
+1. escolher 1 pipeline piloto
+2. criar tabela resumo
+3. criar tabela detalhe
+4. criar catálogo de testes
+
+## Semana 2
+
+5. implementar 3 testes específicos
+6. gravar resumo
+7. gravar detalhe
+8. validar manualmente
+
+## Semana 3
+
+9. integrar no Step Functions
+10. criar query de consolidação final
+11. bloquear execução quando houver `FATAL`
+
+## Semana 4
+
+12. criar 5 templates genéricos
+13. expandir para outro modelo
+14. montar painel de qualidade
+
+---
+
+# Erros comuns de implantação
+
+## 1. Querer começar com 50 testes
+
+Comece com 3 a 5.
+
+## 2. Não definir severidade
+
+Sem severidade, tudo parece igual.
+
+## 3. Não guardar `id_execucao`
+
+Sem isso, auditoria fica fraca.
+
+## 4. Misturar resumo e detalhe
+
+Separe.
+
+## 5. Não versionar regra crítica
+
+Se a regra mudar, marque versão.
+
+## 6. Não escolher um pipeline piloto
+
+Sem piloto, você se perde.
+
+---
+
+# Minha recomendação prática para você
+
+Se eu fosse te guiar nisso no seu ambiente, eu começaria por:
+
+## Modelo piloto
+
+`tb_gld_sem_pagamento_consolidado`
+
+## Testes iniciais
+
+* unicidade da chave funcional
+* nulidade de contrato/produto
+* range de percentual
+* reconciliação simples de `vl_pago`
+
+## Tabelas de controle
+
+* `tb_auditoria_testes_dados`
+* `tb_auditoria_testes_detalhe`
+* `tb_catalogo_testes_dados`
+
+## Integração
+
+Step Functions com:
+
+* modelo
+* 4 testes
+* consolidação
+* fail on fatal
+
+---
+
+# Frase-mãe
+
+> **teste bom não é o que você roda uma vez;
+> teste bom é o que deixa rastro, histórico e decisão operacional.**
+
+No próximo passo, eu posso te devolver um pacote ainda mais prático com:
+
+* DDL final das 3 tabelas,
+* 10 testes Athena prontos,
+* e um esqueleto de state machine para executar modelo + testes + aprovação.
