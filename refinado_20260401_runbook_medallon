@@ -1,0 +1,5453 @@
+
+A ideia é montar um modelo de dados que vai servir para processos como:
+- Pagadoria ADM
+- Pagadoria JUD
+- Ajuizamento
+- Apuração de Carteira
+
+Entre outros processos.
+
+Eu usarei os seguintes elementos na stack para isso:
+
+- **S3** -> storage
+- **Athena** -> computação em SQL
+- **Glue Catalog** -> catálogo de metadados
+- **Iceberg** (embutido no Athena) -> formato de tabela
+- **Step Functions** -> orquestração
+- **EventBridge** -> agendamento e disparos
+
+A arquitetura segue o padrão **Medallion (Bronze → Silver → Gold)**, muito usado em plataformas [[Lakehouse]], que são plataformas que juntam dados desde a origem ao tratamento.
+
+---
+## Contexto
+
+
+Em termos simples, a ideia é criar um fluxo em que os dados:
+
+- entram de forma mais bruta, como arquivos Excel em formato CSV ou tabelas pré processadas, vindos de outras equipes
+    
+- passam por organização e limpeza
+    
+- ganham estrutura e confiança
+    
+- depois viram tabelas prontas para consumo analítico
+    
+
+Estrutura básica:
+
+```text
+Fontes
+   ↓
+Bronze : Tabelas com pouca ou nenhuma modificação
+   ↓
+Silver : Aplicação de regras de tratamento e de negócio
+   ↓
+Gold : Seleção, filtro de dados e construção de campos de negócio
+   ↓
+Consumo : Alimento de Relatórios e Dashboards 
+```
+---
+ A ideia dessa arquitetura é juntar a rapidez de "só subir" os dados com a segurança de ter os dados tratados e disponíveis no melhor formato, **evoluindo a qualidade** entre as camadas
+ ---
+
+# 🧱 Arquitetura alvo / estrutura na prática
+
+```text
+Fontes 
+  │
+  ▼
+Ingestão (Glue / SQL de Consulta / upload manual de Excel CSV)
+  │
+  ▼
+S3 Bronze
+  │
+  ▼
+Athena Transform
+  │
+  ▼
+S3 Silver
+  │
+  ▼
+Athena MERGE
+  │
+  ▼
+Athena + Iceberg Gold
+  │
+  ▼
+Mart / QuickSight / consumo analítico
+```
+
+Em termos simples:
+
+- os dados chegam de alguma fonte
+    
+- entram no **Bronze** quase como vieram
+    
+- passam por transformações no **Athena**
+    
+- viram dados mais confiáveis na **Silver**
+    
+- depois são refinados para consumo na **Gold**
+    
+- por fim, alimentam dashboards, relatórios, análises e data marts
+    
+
+---
+
+# 🧱 Estrutura do Data Lake
+
+Criar a estrutura no S3.
+
+```text
+s3://lakehouse/
+
+    bronze/
+        cobranca/
+            boletos/
+            pagamentos/
+
+    silver/
+        cobranca/
+            contratos/
+            parcelas/
+
+    gold/
+        cobranca/
+            carteira_snapshot/
+            rollrate/
+
+    mart/
+        cobranca/
+            dashboards/
+
+    ops/
+        athena_results/
+        logs/
+        auditoria/
+```
+
+Essa organização ajuda a deixar claro:
+
+- em que camada cada dado está
+    
+- qual é o nível de tratamento daquele dado
+    
+- onde procurar cada tipo de informação
+    
+- onde ficam os artefatos operacionais da pipeline, caso existam
+    
+
+---
+
+# 🧠 O que cada componente faz
+
+## **S3**
+
+É o armazenamento base.
+
+Em termos simples:
+
+- é onde os arquivos e tabelas ficam fisicamente
+    
+- escala bem ("quase" ilimitado)
+
+---
+
+## **Athena**
+
+É o motor SQL .
+
+O Athena serve para consultar dados diretamente no S3 com SQL e integra com Glue Data Catalog, Iceberg e QuickSight.
+
+Em termos simples:
+
+- você escreve SQL
+    
+- o Athena lê os dados no S3
+    
+- processa
+    
+- devolve resultado
+    
+- e cobra por uso
+    
+
+---
+
+## **Glue Catalog**
+
+É o catálogo de metadados.
+
+Em termos simples:
+
+- guarda definição de banco, tabela, colunas, partições e localização
+    
+- ajuda o Athena a “entender” o que existe no S3
+    
+- funciona como um dicionário central dos dados
+    
+
+### **Exemplo 1 — Listar tabelas do database**
+
+```sql
+SELECT *  
+FROM information_schema.tables  
+WHERE table_schema = 'workspace_db';
+```
+
+#### 🧠 Resultado típico
+
+| table_schema | table_name        | table_type     |
+| ------------ | ----------------- | -------------- |
+| workspace_db | bronze_pagamentos | EXTERNAL_TABLE |
+| workspace_db | silver_pagamentos | BASE_TABLE     |
+| workspace_db | gold_carteira     | BASE_TABLE     |
+|              |                   |                |
+
+
+#### 🧠 Explicando
+
+- `table_schema` → database (Glue)
+- `table_name` → nome da tabela
+- `table_type` → tipo (Iceberg aparece como BASE_TABLE)
+
+---
+
+### **🧱 Exemplo 2 — Ver colunas de uma tabela**
+
+```sql 
+SELECT *  
+FROM information_schema.columns  
+WHERE table_schema = 'workspace_db'  
+  AND table_name = 'silver_pagamentos';
+
+```
+
+#### 🧠 **Resultado**
+
+| column_name    | data_type | ordinal_position |
+| -------------- | --------- | ---------------- |
+| contrato_id    | varchar   | 1                |
+| valor          | double    | 2                |
+| data_pagamento | date      | 3                |
+| data_particao  | integer   | 4                |
+| dt_carga       | timestamp | 5                |
+
+#### 🧠 **Explicando**
+
+- `column_name` → nome da coluna
+- `data_type` → tipo no Athena
+- `ordinal_position` → ordem da coluna
+
+👉 Isso vem direto do Glue Catalog
+
+
+
+---
+
+## **Iceberg**
+
+É o formato moderno de tabela.
+
+Ele adiciona uma camada de controle sobre os arquivos no S3, transformando um conjunto de arquivos Parquet em uma **tabela com comportamento semelhante a um banco de dados**.
+
+Isso resolve limitações importantes que o Parquet sozinho não cobre bem, como:
+
+
+---
+
+- **MERGE / UPDATE / DELETE**
+
+Permite modificar dados diretamente na tabela.
+
+👉 Exemplo - Aqui a partir da tabela/cte "nova_carga", ele verifica se o contrato estava presente na tabela "silver_pagamentos", se sim, atualiza com o  novo valor, se não, insere novos dados.
+
+```sql
+MERGE INTO silver_pagamentos t  
+USING nova_carga s  
+ON t.contrato_id = s.contrato_id  
+  
+WHEN MATCHED THEN UPDATE SET valor = s.valor  
+WHEN NOT MATCHED THEN INSERT VALUES (...);
+```
+Sem Iceberg, isso exigiria recriar arquivos inteiros.
+
+---
+
+- **Controle de snapshots (versionamento)**
+
+Cada alteração na tabela gera uma nova versão (snapshot).
+
+Isso significa que o Iceberg mantém um histórico completo do estado da tabela ao longo do tempo — como se fosse um **“git dos dados”**.
+
+👉 Exemplo:
+
+SELECT * FROM silver_pagamentos$snapshots;
+
+Você consegue ver:
+
+- quando a tabela mudou
+- qual operação gerou a mudança (INSERT, MERGE, DELETE)
+- quantos arquivos foram afetados
+- e o **snapshot_id** de cada versão
+
+---
+
+### 🔎 Como usar isso na prática
+
+👉 Ver histórico de mudanças:
+
+```sql
+SELECT *  
+FROM silver_pagamentos$history;
+```
+---
+
+👉 Consultar a tabela em um ponto específico do passado (sem alterar nada):
+
+```sql
+SELECT *  
+FROM silver_pagamentos  
+FOR VERSION AS OF 949530903748831860;
+```
+ou por data:
+
+```sql
+SELECT *  
+FROM silver_pagamentos  
+FOR TIMESTAMP AS OF TIMESTAMP '2026-03-30 10:00:00 UTC';
+```
+---
+
+### 🔄 “Control Z” na prática
+
+Iceberg permite voltar no tempo — mas no Athena isso funciona em dois níveis:
+
+#### 1. **Consultar o passado (seguro)**
+
+Você só lê os dados como eram antes:
+
+```sql
+SELECT *  
+FROM silver_pagamentos  
+FOR VERSION AS OF <snapshot_id>;
+```
+---
+
+#### 2. **Restaurar o passado (manual, porém poderoso)**
+
+Você recria a tabela a partir de uma versão antiga:
+
+```sql
+CREATE TABLE silver_pagamentos_restaurada  
+WITH (table_type = 'ICEBERG')  
+AS  
+SELECT *  
+FROM silver_pagamentos  
+FOR VERSION AS OF <snapshot_id>;
+```
+---
+3. **Restaurar o passado (manual, opção mais rápida, mas que precisa ser feita com cuidado)**
+
+Você deleta os dados e insere de novo a partir de um certo momento.
+
+**Mas, é importante garantir que haja o snapshot anterior salvo**
+
+É parecido com fazer um "Control Z" ou como desligar o videogame e voltar no save.
+
+Mas para isso é importante garantir que exista um "save".
+
+```sql
+--- Execute primeiro
+DELETE FROM workspace_db.silver_pagamentos;  
+  
+
+--- Execute depois  
+INSERT INTO workspace_db.silver_pagamentos  
+SELECT *  
+FROM workspace_db.silver_pagamentos  
+FOR VERSION AS OF 949530903748831860;
+```
+
+### ⚠️ Cuidados importantes
+
+- sem snapshot → sem “voltar no tempo”
+- sempre valide antes de restaurar (ideal criar tabela paralela)
+
+---
+
+### 💡 Insight de engenharia (alto valor)
+
+Esse controle de snapshots é o que permite:
+
+- pipelines incrementais confiáveis
+- reprocessamento seguro
+- auditoria de mudanças
+- rollback em caso de erro
+
+👉 É literalmente o que transforma um data lake em algo próximo de um banco transacional.
+
+
+---
+
+- **Evolução de schema**
+
+Permite alterar a estrutura da tabela sem quebrar dados antigos.
+
+👉 Exemplo:
+
+ALTER TABLE silver_pagamentos  
+ADD COLUMN canal_pagamento VARCHAR;
+
+Dados antigos continuam válidos, mesmo sem essa coluna.
+
+---
+
+No Athena, Iceberg suporta operações como:
+
+- **MERGE INTO** → atualizar e inserir dados na mesma operação
+- **UPDATE / DELETE** → modificar dados existentes
+- **CTAS com Iceberg** → criar tabelas já com suporte a versionamento e incremental
+
+
+---
+
+**Resumo prático:**
+
+> Parquet organiza arquivos  
+> Iceberg organiza a tabela inteira (com histórico, controle e atualização segura)
+
+---
+
+## **Step Functions**
+
+É a orquestração do fluxo. Como se fosse o maestro, que faz com que cada músico toque corretamente, de forma coordenada.
+
+Em termos simples:
+
+- decide a ordem das etapas
+    
+- chama queries Athena
+    
+- chama jobs Glue
+    
+- trata erros
+    
+- permite organizar o fluxo de execução
+
+---
+
+## **EventBridge**
+
+É o gatilho, que funciona como se fosse um "Se -> Então", por exemplo, se for 12h00 então execute isso.
+
+Em termos simples:
+
+- agenda execução
+    
+- dispara fluxo por horário   
+
+---
+
+# 🧱 Passo 1 (Não se aplica) — Criar o database
+
+> [!Explicação]  
+> Observação: **não se aplica no seu cenário atual**, porque, por convenção, tudo está sendo salvo no `workspace_db`.
+
+No Athena:
+
+```sql
+CREATE DATABASE lakehouse
+LOCATION 's3://lakehouse/';
+```
+
+Esse passo aparece mais como referência conceitual.
+
+Na prática, se no seu ambiente o database padrão já é o `workspace_db`, você pode seguir nele. O ponto mais importante aqui não é o nome do database, e sim:
+
+- organização
+    
+- padronização
+    
+- governança
+    
+- clareza de propósito
+    
+
+---
+
+# 🧱 Passo 2 — Criar tabela Bronze
+
+A camada Bronze normalmente tem estas características:
+
+- formato como **Parquet**, CSV ou outro formato de entrada
+    
+- comportamento **append-oriented**, ou seja, apenas novas inserções por padrão.
+    
+- poucas regras de negócio
+    
+- estrutura próxima da origem
+    
+- preservação do máximo possível do dado recebido
+    
+
+Em outras palavras:
+
+- o Bronze guarda o dado quase como ele chegou
+    
+- ele não é a camada “bonita”
+    
+- ele é a base de entrada do pipeline
+    
+
+Não é que “nunca pode mudar”, e sim que **o padrão saudável é preservar a entrada**.
+
+---
+
+## Criar tabelas ainda sem dados
+
+```sql
+CREATE TABLE lakehouse.bronze_pagamentos
+WITH (
+    format = 'PARQUET',
+    external_location = 's3://lakehouse/bronze/cobranca/pagamentos/'
+) AS
+SELECT
+    CAST(NULL AS VARCHAR)  AS contrato_id,
+    CAST(NULL AS DOUBLE)   AS valor,
+    CAST(NULL AS DATE)     AS data_pagamento,
+    CAST(NULL AS INTEGER)  AS anomesdia
+WHERE 1 = 0;
+```
+
+Esse padrão cria a estrutura da tabela mesmo sem carregar nenhuma linha.
+
+É útil quando você quer:
+
+- preparar a camada antes da carga
+    
+- definir o schema
+    
+- deixar a tabela pronta para receber dados depois
+    
+
+No Athena, isso é um uso comum de **CTAS**. A documentação cobre CTAS como forma de criar tabela a partir de query.
+
+---
+
+## Criar tabelas a partir de outra tabela
+
+```sql
+CREATE TABLE lakehouse.bronze_pagamentos
+WITH (
+    format = 'PARQUET',
+    external_location = 's3://lakehouse/bronze/cobranca/pagamentos/'
+) AS
+SELECT
+    CAST(contrato_id AS VARCHAR)      AS contrato_id,
+    CAST(valor AS DOUBLE)             AS valor,
+    CAST(data_pagamento AS DATE)      AS data_pagamento,
+    CAST(anomesdia AS INTEGER)        AS anomesdia
+FROM lakehouse.tabela_exemplo;
+```
+
+Esse padrão é útil quando o dado já existe em outra tabela e você quer montar rapidamente uma camada Bronze.
+
+O objetivo aqui é manter:
+
+- histórico completo
+    
+- schema próximo ao original
+    
+
+Ou seja:
+
+- não transformar demais
+    
+- não aplicar regras pesadas
+    
+- apenas trazer o dado para a estrutura Bronze
+    
+
+---
+
+## Criar tabelas a partir de um Excel
+
+O Athena **não lê `.xlsx` diretamente** como tabela.
+
+Ou seja: não dá para simplesmente subir um Excel no S3 e sair consultando como se já fosse tabela.
+
+### 💡 Então qual é o caminho?
+
+Se você recebe arquivos Excel, o fluxo ideal é:
+
+- receber o Excel
+    
+- converter para **CSV** usando o [[código de conversão de excel para csv]]
+    
+- subir o CSV no S3 Bronze
+    
+- registrar tabela no Athena via Create Table
+    
+
+Exemplo:
+
+```text
+s3://lakehouse/bronze/cobranca/pagamentos_excel/
+```
+
+Em termos simples:
+
+> o Excel é o arquivo de entrada, mas o arquivo que o Athena realmente vai ler precisa estar em um formato simples e previsível.
+
+---
+
+### 🧱 Criando a tabela no Athena a partir de arquivo CSV
+
+Se o CSV estiver separado por `|`:
+
+```sql
+CREATE EXTERNAL TABLE workspace_db.bronze_pagamentos_excel (
+    contrato_id string,
+    valor double,
+    data_pagamento date,
+    anomesdia int
+)
+ROW FORMAT SERDE 'org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe'
+WITH SERDEPROPERTIES (
+    'field.delim' = '|',
+    'skip.header.line.count' = '1'
+)
+STORED AS TEXTFILE
+LOCATION 's3://lakehouse/bronze/cobranca/pagamentos_excel/';
+```
+
+Essa definição diz para o Athena:
+
+- onde está o arquivo
+    
+- como ele deve ser lido
+    
+- qual separador foi usado
+    
+- quais são as colunas e seus tipos
+    
+
+A documentação do Athena cobre criação de tabelas com SerDes e uso de CSV/texto.
+
+---
+
+### 🧠 Explicando em termos simples
+
+#### `ROW FORMAT SERDE`
+
+Define como o Athena interpreta o arquivo.
+
+#### `'field.delim' = '|'`
+
+Diz que as colunas estão separadas por `|`.
+
+#### `'skip.header.line.count' = '1'`
+
+Ignora a primeira linha, que normalmente é cabeçalho.
+
+#### `STORED AS TEXTFILE`
+
+Informa que o arquivo é texto.
+
+#### `LOCATION`
+
+Aponta para a pasta do S3.
+
+---
+
+### ⚠️ Erros comuns
+
+#### ❌ Esquecer o delimiter
+
+O Athena pode ler a linha inteira como uma única coluna.
+
+#### ❌ Não ignorar o header
+
+O nome da coluna vira dado.
+
+#### ❌ Tipos errados
+
+Valor mal formatado vira `NULL` ou distorce análise.
+
+#### ❌ Misturar arquivos incompatíveis na mesma pasta
+
+Se um arquivo tiver estrutura diferente, a tabela pode passar a ler lixo.
+
+---
+
+### 🧪 Teste rápido
+
+```sql
+SELECT *
+FROM workspace_db.bronze_pagamentos_excel
+LIMIT 10;
+```
+
+Verifique:
+
+- se as colunas estão separadas corretamente
+    
+- se datas foram lidas como datas
+    
+- se valores fazem sentido
+    
+
+---
+
+### 🔄 Fluxo simplificado
+
+```text
+Excel (.xlsx)
+   ↓
+Conversão para CSV
+   ↓
+Upload no S3 Bronze
+   ↓
+Athena lê como tabela
+```
+
+---
+
+# 🧱 Passo 3 — Ingestão Bronze
+
+A carga para o Bronze pode vir de diferentes formas.
+
+### Exemplos comuns
+
+- **Glue Job**
+    
+- **outra tabela já existente**
+    
+- **upload manual**
+    
+- **API / extração batch**
+    
+- **evento agendado**
+    
+
+---
+
+## 🔄 Exemplos práticos
+
+### 🔹 1. Via Glue Job
+
+```text
+Fonte → transformação leve → Parquet → S3 Bronze
+```
+
+Usado quando:
+
+- há integração recorrente
+    
+- existe pipeline estruturado
+    
+- volume é maior
+    
+- o processo precisa rodar sozinho
+     
+- existe uma complexidade necessária maior
+
+Exemplo: 
+Tem que ler vários arquivos de Excel para obter informações e com essas informações, fazer cálculos.
+
+
+
+
+---
+
+### **🔹 2. A partir de outra tabela**
+
+```text
+Tabela origem → SELECT → CTAS → Bronze
+```
+
+```sql
+CREATE TABLE workspace_db.bronze_pagamentos
+WITH (
+    format = 'PARQUET',
+    external_location = 's3://lakehouse/bronze/cobranca/pagamentos/'
+) AS
+SELECT *
+FROM workspace_db.tabela_origem;
+```
+
+---
+
+### **🔹 3. Upload manual**
+
+```text
+Excel → CSV → upload S3 → Athena
+```
+
+Usado quando:
+
+- o processo é manual
+    
+- o arquivo chega por e-mail
+    
+- a carga é pontual ou mensal
+    
+- ainda não existe automação
+    
+
+---
+
+## 🧠 Papel do Bronze
+
+Independentemente da origem, o Bronze deve buscar:
+
+- **histórico**
+    
+- **mínima transformação**
+    
+- **proximidade com a origem**
+    
+- **rastreamento da carga**
+    
+
+Boa prática:
+
+- adicionar colunas como `dt_ingestao`, `arquivo_origem`, `id_execucao`, `sistema_origem` caso sejam aplicáveis.
+    
+
+Isso ajuda muito em:
+
+- auditoria
+    
+- Resolver problemas (troubleshooting)
+    
+- reconciliação
+    
+- reprocessamento
+    
+
+---
+
+# 🧱 Passo 4 — Criar tabela Silver
+
+A camada Silver já representa um dado **confiável e padronizado**.
+
+Ela resolve problemas comuns da Bronze:
+
+- tipos inconsistentes
+    
+- registros inválidos
+    
+- duplicidade
+    
+- colunas fora do padrão
+    
+- pequenas harmonizações entre fontes
+    
+
+Em outras palavras:
+
+> Silver é a camada em que o dado deixa de ser apenas “legível” e passa a ser “confiável”.
+
+
+---
+
+## O que a Silver deve garantir
+
+- tipagem correta
+    
+- dados válidos
+    
+- deduplicação
+    
+- padronização
+    
+- regras básicas de negócio
+    
+- granularidade clara
+    
+
+### ⚠️ Ponto crítico: **grain**
+
+Antes de modelar a Silver, defina o **grão**.
+
+Exemplo:
+
+> uma linha representa o quê?
+
+- um pagamento?
+    
+- uma parcela?
+    
+- um contrato por dia?
+    
+- um contrato por mês?
+    
+- um cliente por status?
+    
+
+Nos livros de modelagem dimensional, **grain** é uma das decisões mais importantes do modelo, por exemplo, na base de pagadoria, o grão é, por contrato + produto + dia + valor + origem + boleto (se houver boleto), então não deveria haver duplicidade neste nível
+
+---
+
+## Exemplo mais completo
+
+```sql
+CREATE TABLE lakehouse.silver_pagamentos
+WITH (
+    table_type = 'ICEBERG',
+    format = 'PARQUET',
+    location = 's3://lakehouse/silver/cobranca/pagamentos/'
+)
+AS
+WITH base AS (
+
+    SELECT
+        CAST(contrato_id AS VARCHAR) AS contrato_id,
+        CAST(valor AS DOUBLE) AS valor,
+        TRY_CAST(data_pagamento AS DATE) AS data_pagamento,
+        CAST(anomesdia AS INTEGER) AS anomesdia,
+
+        ROW_NUMBER() OVER (
+            PARTITION BY contrato_id, data_pagamento, valor
+            ORDER BY anomesdia DESC
+        ) AS rn
+
+    FROM lakehouse.bronze_pagamentos
+
+),
+
+filtrado AS (
+
+    SELECT *
+    FROM base
+    WHERE
+        valor > 0
+        AND data_pagamento IS NOT NULL
+        AND contrato_id IS NOT NULL
+
+),
+
+deduplicado AS (
+
+    SELECT *
+    FROM filtrado
+    WHERE rn = 1
+
+)
+
+SELECT
+    contrato_id,
+    valor,
+    data_pagamento,
+    anomesdia
+FROM deduplicado;
+```
+
+---
+
+## 🧠 O que melhoramos aqui
+
+### 1. Tipagem defensiva
+
+```sql
+TRY_CAST(data_pagamento AS DATE)
+```
+
+Evita que a pipeline quebre por causa de data inválida.
+Precisa ser usada com cuidado por que pode mascarar erros
+
+---
+
+### 2. Deduplicação
+
+```sql
+ROW_NUMBER() OVER (...)
+```
+
+Mantém só a linha mais adequada segundo a regra definida.
+
+---
+
+### 3. Filtro de qualidade
+
+```sql
+valor > 0
+data_pagamento IS NOT NULL
+```
+
+Impede "lixo" evidente de avançar.
+
+---
+
+### 4. Separação por etapas
+
+```text
+base → filtrado → deduplicado
+```
+
+Melhora leitura, debug e manutenção.
+
+---
+
+## 🎯 Regra prática
+
+> Bronze = dado como veio  
+> Silver = dado confiável  
+> Gold = dado interpretado pelo negócio
+
+---
+
+# 🧱 Passo 5 — Incremental na Silver
+
+Quando o volume cresce, não faz sentido reprocessar tudo sempre.
+
+Isso é:
+
+- mais lento
+    
+- mais caro
+    
+- mais difícil de manter
+    
+
+## Ideia principal
+
+> processar apenas o que é novo ou o que pode ter mudado
+
+---
+
+## Primeira abordagem: simples, mas limitada
+
+```sql
+INSERT INTO lakehouse.silver_pagamentos
+SELECT *
+FROM lakehouse.bronze_pagamentos
+WHERE anomesdia >= 20240101;
+```
+
+Funciona no começo, mas depende de manutenção manual.
+
+---
+
+## Abordagem um pouco melhor: baseada no que já foi carregado
+
+```sql
+INSERT INTO lakehouse.silver_pagamentos
+SELECT *
+FROM lakehouse.bronze_pagamentos
+WHERE anomesdia > (
+    SELECT COALESCE(MAX(anomesdia), 0)
+    FROM lakehouse.silver_pagamentos
+);
+```
+
+Olha a última data já carregada e busca só o que veio depois.
+
+---
+
+## ⚠️ Limitações do INSERT incremental
+
+Esse modelo:
+
+- só insere
+    
+- não corrige linha antiga
+    
+- não lida bem com dado atrasado
+    
+- não resolve bem alteração retroativa
+    
+
+---
+
+## Evolução correta: MERGE com Iceberg
+
+Para isso, usamos **MERGE**.
+
+No Athena com Iceberg, `MERGE INTO` permite combinar inserção, atualização e exclusão em uma operação transacional.
+
+```sql
+MERGE INTO lakehouse.silver_pagamentos AS destino
+USING (
+
+    SELECT
+        contrato_id,
+        valor,
+        TRY_CAST(data_pagamento AS DATE) AS data_pagamento,
+        anomesdia
+    FROM lakehouse.bronze_pagamentos
+    WHERE anomesdia >= (
+        SELECT COALESCE(MAX(anomesdia), 0) - 7
+        FROM lakehouse.silver_pagamentos
+    )
+
+) AS origem
+
+ON destino.contrato_id = origem.contrato_id
+AND destino.data_pagamento = origem.data_pagamento
+
+WHEN MATCHED THEN
+    UPDATE SET
+        valor = origem.valor,
+        anomesdia = origem.anomesdia
+
+WHEN NOT MATCHED THEN
+    INSERT (
+        contrato_id,
+        valor,
+        data_pagamento,
+        anomesdia
+    )
+    VALUES (
+        origem.contrato_id,
+        origem.valor,
+        origem.data_pagamento,
+        origem.anomesdia
+    );
+```
+
+---
+
+## 🧠 O que esse MERGE faz
+
+- se o registro já existe → atualiza
+    
+- se não existe → insere
+    
+
+E ainda:
+
+- reprocessa uma **janela de segurança**
+    
+- reduz risco de perder dado atrasado
+    
+- evita parte da duplicidade
+    
+
+---
+
+## 🎯 Chave do MERGE
+
+A chave define o que é “o mesmo registro”.
+
+Exemplo:
+
+```text
+contrato_id + data_pagamento
+```
+
+Mas, no mundo real, isso precisa refletir o **grão real**. Muitas vezes, no seu contexto, algo como:
+
+```text
+contrato + produto + data + valor
+```
+
+é mais seguro.
+
+---
+
+## ⚠️ Cuidados
+
+### 1. Só funciona de verdade com Iceberg
+
+Parquet sozinho não te dá essa mesma capacidade transacional.
+
+### 2. MERGE é mais pesado que INSERT, ou seja, demora mais.
+
+Custa mais, mas é mais confiável.
+
+### 3. A chave precisa ser boa
+
+Se a chave estiver errada:
+
+- duplica
+    
+- sobrescreve errado
+    
+- gera inconsistência silenciosa
+    
+
+### 4. Janela curta demais pode perder ajuste retroativo
+
+Às vezes `-7` dias basta.  
+Às vezes o seu processo exige `-30` ou até reprocessar o mês aberto.
+
+---
+
+# 🧱 Passo 6 — Reprocessamento inteligente sem tabela de controle
+
+## Ideia principal
+
+> O pipeline descobre o que precisa reprocessar comparando:
+> 
+> - a última partição já consolidada
+>     
+> - com metadados dos arquivos da Bronze
+>     
+
+---
+
+## Tradução simples
+
+> “Se um arquivo do Bronze mudou depois da última referência consolidada, vale recalcular aquela faixa.”
+
+---
+
+## Tabelas necessárias
+
+### Bronze particionada
+
+```sql
+CREATE EXTERNAL TABLE workspace_db.bronze_pagamentos (
+    contrato_id string,
+    valor double,
+    data_pagamento date
+)
+PARTITIONED BY (data_particao int)
+STORED AS PARQUET
+LOCATION 's3://lakehouse/bronze/cobranca/pagamentos/';
+```
+
+### Silver Iceberg
+
+```sql
+CREATE TABLE workspace_db.silver_pagamentos (
+    contrato_id string,
+    valor double,
+    data_pagamento date,
+    data_particao int,
+    dt_carga timestamp
+)
+WITH (
+    table_type = 'ICEBERG',
+    format = 'PARQUET',
+    partitioning = ARRAY['data_particao'],
+    location = 's3://lakehouse/silver/cobranca/pagamentos/'
+);
+```
+
+---
+
+## Como detectar partições alteradas
+
+### Passo 1 — descobrir última partição da Silver
+
+```sql
+SELECT COALESCE(MAX(data_particao), 0) AS ultima_particao
+FROM workspace_db.silver_pagamentos;
+```
+
+### Passo 2 — comparar com metadados do Bronze
+
+Usando:
+
+- `$file_modified_time`
+    
+
+---
+
+## MERGE incremental completo
+
+```sql
+MERGE INTO workspace_db.silver_pagamentos AS destino
+USING (
+
+    WITH ultima_particao AS (
+        SELECT COALESCE(MAX(data_particao), 0) AS ultima_particao
+        FROM workspace_db.silver_pagamentos
+    ),
+
+    particoes_alteradas AS (
+        SELECT DISTINCT b.data_particao
+        FROM workspace_db.bronze_pagamentos b
+        CROSS JOIN ultima_particao u
+        WHERE b."$file_modified_time" >= CAST(
+            date_parse(CAST(u.ultima_particao AS VARCHAR), '%Y%m%d') AS timestamp
+        )
+    ),
+
+    origem_filtrada AS (
+        SELECT
+            CAST(b.contrato_id AS VARCHAR) AS contrato_id,
+            CAST(b.valor AS DOUBLE) AS valor,
+            TRY_CAST(b.data_pagamento AS DATE) AS data_pagamento,
+            CAST(b.data_particao AS INTEGER) AS data_particao,
+            current_timestamp AS dt_carga
+        FROM workspace_db.bronze_pagamentos b
+        INNER JOIN particoes_alteradas p
+            ON b.data_particao = p.data_particao
+    ),
+
+    origem_deduplicada AS (
+        SELECT *
+        FROM (
+            SELECT
+                contrato_id,
+                valor,
+                data_pagamento,
+                data_particao,
+                dt_carga,
+                ROW_NUMBER() OVER (
+                    PARTITION BY contrato_id, data_pagamento
+                    ORDER BY data_particao DESC
+                ) AS rn
+            FROM origem_filtrada
+            WHERE valor > 0
+              AND contrato_id IS NOT NULL
+              AND data_pagamento IS NOT NULL
+        ) x
+        WHERE rn = 1
+    )
+
+    SELECT
+        contrato_id,
+        valor,
+        data_pagamento,
+        data_particao,
+        dt_carga
+    FROM origem_deduplicada
+
+) AS origem
+
+ON destino.contrato_id = origem.contrato_id
+AND destino.data_pagamento = origem.data_pagamento
+
+WHEN MATCHED THEN
+UPDATE SET
+    valor = origem.valor,
+    data_particao = origem.data_particao,
+    dt_carga = origem.dt_carga
+
+WHEN NOT MATCHED THEN
+INSERT (
+    contrato_id,
+    valor,
+    data_pagamento,
+    data_particao,
+    dt_carga
+)
+VALUES (
+    origem.contrato_id,
+    origem.valor,
+    origem.data_pagamento,
+    origem.data_particao,
+    origem.dt_carga
+);
+```
+
+---
+
+## 🧠 Benefícios
+
+- não precisa tabela auxiliar
+    
+- é dinâmico
+    
+- reduz reprocessamento
+    
+- captura correções retroativas
+    
+- aproveita metadados do próprio lake
+    
+
+---
+
+## ⚠️ Cuidados
+
+### 1. Nem toda alteração de arquivo significa alteração lógica relevante
+
+Às vezes você reprocessa sem necessidade.
+
+### 2. Comparar com “última partição” é útil, mas não resolve tudo
+
+Se houver ajuste muito antigo, talvez essa estratégia não pegue.
+
+
+Ou seja: essa abordagem é elegante, mas não é bala de prata.
+
+---
+
+# 🧱 Passo 7 — Popular Gold
+
+A camada **Gold** é onde os dados ficam prontos para responder pergunta de negócio.
+
+Aqui entram:
+
+- agregações
+    
+- métricas
+    
+- snapshots
+    
+- indicadores
+    
+- tabelas de consumo semântico
+    
+
+Exemplo:
+
+```sql
+INSERT INTO lakehouse.gold_carteira
+SELECT
+    contrato_id,
+    SUM(valor) AS saldo,
+    current_date AS data_snapshot
+FROM lakehouse.silver_pagamentos
+GROUP BY contrato_id;
+```
+
+### O que esse exemplo faz
+
+- consolida pagamentos por contrato
+    
+- calcula `saldo`
+    
+- registra a data do retrato
+    
+
+Em vez de olhar pagamento a pagamento, a Gold já entrega uma visão consolidada.
+
+---
+
+## ⚠️ Observação conceitual importante
+
+Nem toda Gold precisa ser agregada.
+
+Gold pode ser:
+
+- uma tabela de snapshot
+    
+- uma tabela fato
+    
+- uma dimensão tratada
+    
+- uma base semântica
+    
+- uma tabela analítica pronta para BI
+    
+
+No seu contexto, por exemplo, **Gold** pode perfeitamente conter entidades como:
+
+- carteira elegível
+    
+- pagamento consolidado
+    
+- regul
+    
+- caixa
+    
+- atingimento
+    
+- comissão
+    
+
+Ou seja: Gold é mais “camada semântica de negócio” do que apenas “tabela resumida”.
+
+---
+
+# 🧱 Passo 8 — Atualização incremental Gold
+
+Assim como Silver, Gold também não deve ser recriada inteira toda vez.
+
+Exemplo com MERGE:
+
+```sql
+MERGE INTO lakehouse.gold_carteira t
+USING (
+    SELECT
+        contrato_id,
+        SUM(valor) AS saldo
+    FROM lakehouse.silver_pagamentos
+    GROUP BY contrato_id
+) s
+ON t.contrato_id = s.contrato_id
+
+WHEN MATCHED THEN
+UPDATE SET saldo = s.saldo
+
+WHEN NOT MATCHED THEN
+INSERT (contrato_id, saldo)
+VALUES (s.contrato_id, s.saldo);
+```
+
+### O que isso faz
+
+- se o contrato já existe → atualiza
+    
+- se não existe → insere
+    
+
+---
+
+## ⚠️ Em produção, normalmente falta:
+
+- `data_snapshot`
+    
+- controle da janela de atualização
+    
+- chave mais robusta
+    
+- talvez partição temporal
+    
+
+Então esse SQL é ótimo para entender o conceito, mas produção costuma exigir mais cuidado.
+
+---
+
+# 🧱 Passo 9 — Orquestração
+
+Até aqui falamos das tabelas.
+
+Agora entra a parte que faz tudo rodar **na ordem certa**.
+
+Arquitetura típica:
+
+```text
+EventBridge
+    ↓
+Step Functions
+    ↓
+Athena Query / Glue Job
+    ↓
+Atualização das camadas
+```
+
+A documentação do Step Functions descreve workflows como state machines compostas por estados, com integração direta com Athena e Glue
+Ou seja, é como uma receita, em que o bolo só vai para assar no forno quando os ingredientes foram misturados e já estão na forma.
+
+---
+
+## Step Functions Flow
+
+```text
+Start
+ ↓
+Ingest Bronze
+ ↓
+Process Silver
+ ↓
+Update Gold
+ ↓
+Refresh Mart
+ ↓
+End
+```
+
+### Leitura simples
+
+1. entra dado novo
+    
+2. sobe para Bronze
+    
+3. Silver trata
+    
+4. Gold consolida
+    
+5. Mart fica pronto
+    
+6. consumo acontece
+    
+
+---
+
+## Exemplo simples de state machine
+
+```json
+{
+  "StartAt": "MergeSilver",
+  "States": {
+    "MergeSilver": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::athena:startQueryExecution.sync",
+      "Arguments": {
+        "QueryString": "SQL_DO_MERGE",
+        "WorkGroup": "primary",
+        "ResultConfiguration": {
+          "OutputLocation": "s3://lakehouse/ops/results/"
+        }
+      },
+      "Next": "UpdateGold"
+    },
+    "UpdateGold": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::athena:startQueryExecution.sync",
+      "Arguments": {
+        "QueryString": "SQL_GOLD",
+        "WorkGroup": "primary",
+        "ResultConfiguration": {
+          "OutputLocation": "s3://lakehouse/ops/results/"
+        }
+      },
+      "Next": "RefreshMart"
+    },
+    "RefreshMart": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::athena:startQueryExecution.sync",
+      "Arguments": {
+        "QueryString": "SQL_MART",
+        "WorkGroup": "primary",
+        "ResultConfiguration": {
+          "OutputLocation": "s3://lakehouse/ops/results/"
+        }
+      },
+      "End": true
+    }
+  }
+}
+```
+
+O Step Functions suporta integração otimizada com Athena, inclusive no padrão `.sync` para aguardar conclusão da query.
+
+---
+
+## Boas práticas de orquestração
+
+- registrar `id_execucao`
+    
+- salvar logs e resultados técnicos
+    
+- separar erro técnico de erro de qualidade,	ou seja,
+     uma coisa é errar porque não há a tabela a ser consultada (ela foi apagada, por exemplo)
+	Outra coisa é não existir os dados ainda e a informação de pagamento estar defasada;
+    
+- preferir fluxo idempotente
+    
+
+---
+
+# 🧱 Passo 10 — Atualizar Data Mart
+
+A camada **Mart** é a mais próxima do consumo.
+
+Ela costuma ser pensada para:
+
+- dashboard
+    
+- BI
+    
+- relatórios
+    
+- consultas mais simples
+    
+- métricas prontas
+    
+
+Exemplo:
+
+```sql
+CREATE TABLE lakehouse.mart_carteira
+WITH (
+    format = 'PARQUET',
+    external_location = 's3://lakehouse/mart/cobranca/dashboard/'
+)
+AS
+SELECT
+    data_snapshot,
+    SUM(saldo) AS saldo_total
+FROM lakehouse.gold_carteira
+GROUP BY data_snapshot;
+```
+
+### O que isso faz
+
+Entrega uma base mais simples ainda para visualização.
+
+---
+
+# 🧱 Passo 11 — Conectar QuickSight
+
+Depois que o Mart estiver pronto, o consumo no QuickSight fica muito mais simples.
+
+Dataset:
+
+```text
+Athena
+ ↓
+mart_carteira
+```
+
+## Regra importante
+
+> Sempre consumir **mart** ou **gold**.  
+> Nunca **bronze**.
+
+### Por quê?
+
+Porque Bronze:
+
+- ainda está cru
+    
+- pode conter inconsistência
+    
+- não foi desenhado para visualização
+    
+- pode gerar definição de métrica errada
+    
+
+---
+
+# 🧠 Boas práticas importantes
+
+## 1️⃣ Bronze preserva entrada
+
+Não é camada para embelezar dado.
+
+## 2️⃣ Silver padroniza e confere confiança
+
+É onde acontecem:
+
+- deduplicação
+    
+- tipagem
+    
+- validação
+    
+- harmonização
+    
+
+## 3️⃣ Gold modela significado de negócio
+
+É onde entram:
+
+- métricas
+    
+- indicadores
+    
+- snapshots
+    
+- fatos e dimensões de consumo
+    
+
+## 4️⃣ Mart simplifica consumo
+
+É a camada mais amigável para BI. 
+
+## 5️⃣ Grain vem antes do SQL
+
+Antes de codar, responda:
+
+> uma linha representa exatamente o quê?
+
+Sem isso, o lakehouse nasce confuso.
+
+
+## 6️⃣ Conformed dimensions importam
+
+Se várias tabelas analíticas usam “cliente”, “produto”, “data”, “escritório”, essas dimensões precisam conversar entre si.
+
+👉 Ou seja: **mesma definição, mesma chave, mesma regra**
+
+---
+
+### 💥 Problema (sem conformed dimension)
+
+Você tem duas tabelas:
+
+#### 🧱 Fato 1 — pagamentos
+
+fato_pagamentos  
+-------------------------  
+contrato  
+produto  
+cnpj  
+dt_pagamento  
+vl_pago  
+escritorio
+
+---
+
+#### 🧱 Fato 2 — carteira (vigor)
+
+fato_carteira  
+-------------------------  
+contrato  
+produto  
+cnpj_raiz  
+dt_foto  
+vl_saldo  
+escritorio_nome
+
+---
+
+#### 🚨 Problemas clássicos:
+
+- `cnpj` vs `cnpj_raiz`
+- `escritorio` vs `escritorio_nome`
+- regras diferentes de cliente
+- mesma empresa com múltiplas representações
+
+👉 Resultado:
+
+- joins inconsistentes
+- métricas divergentes
+- QuickSight com números diferentes dependendo da tabela
+
+---
+
+### ✅ Solução: Conformed Dimensions
+
+Você cria dimensões padronizadas que **todas as fatos usam**
+
+---
+
+#### 🧩 dim_cliente (conformed)
+
+dim_cliente  
+-------------------------  
+sk_cliente  
+cnpj_completo  
+cnpj_raiz  
+segmento  
+uf  
+dt_inicio_vigencia  
+dt_fim_vigencia  
+fl_ativo
+
+---
+
+#### 🧩 dim_escritorio
+
+dim_escritorio  
+-------------------------  
+sk_escritorio  
+nm_escritorio  
+tipo  
+regional
+
+---
+
+#### 🧩 dim_data
+
+dim_data  
+-------------------------  
+sk_data  
+data  
+ano  
+mes  
+dia_util
+
+---
+
+### 🔗 Agora as fatos ficam assim
+
+#### 🧱 fato_pagamentos
+
+sk_cliente  
+sk_escritorio  
+sk_data  
+vl_pago
+
+---
+
+#### 🧱 fato_carteira
+
+sk_cliente  
+sk_escritorio  
+sk_data  
+vl_saldo
+
+---
+
+### 🎯 O que isso resolve na prática
+
+#### 1. Join confiável
+
+SELECT  
+    d.segmento,  
+    SUM(p.vl_pago) AS total_pago  
+FROM fato_pagamentos p  
+JOIN dim_cliente d  
+    ON p.sk_cliente = d.sk_cliente  
+GROUP BY 1;
+
+👉 Funciona igual em QUALQUER fato
+
+---
+
+#### 2. Métrica consistente
+
+“Cliente PJ” significa a mesma coisa em:
+
+- pagamentos
+- carteira
+- acordos
+- comissionamento
+
+---
+
+#### 3. QuickSight não quebra
+
+Você pode misturar fatos:
+
+- caixa (pagamento)
+- regul (carteira)
+
+👉 sem divergência de dimensão
+
+---
+
+
+
+# 🧠 Particionamento
+
+Muito importante no Athena.
+
+Exemplos de colunas de partição:
+
+```text
+anomes
+anomesdia
+data_particao
+dt_ref
+```
+
+---
+
+### 🎯 Por que isso importa?
+
+Porque o Athena lê **arquivos no S3**, não linhas.
+
+Se a tabela estiver bem particionada:
+
+- lê menos arquivos
+    
+- reduz custo
+    
+- melhora performance
+    
+
+> 💡 Regra de ouro:  
+> você paga pelo que lê
+
+---
+
+## 🔍 1️⃣ Partition Pruning (o mais importante)
+
+### 💡 Ideia simples
+
+> “Se a tabela está particionada por mês, não leia todos os meses — só o necessário”
+
+---
+
+### ❌ Sem pruning
+
+```sql
+SELECT *
+FROM pagamentos
+WHERE valor > 100;
+```
+
+👉 Athena lê **todas as partições**  
+👉 custo alto + lento
+
+---
+
+### ✅ Com pruning
+
+```sql
+SELECT *
+FROM pagamentos
+WHERE mesref = 202601;
+```
+
+👉 Athena lê **só a partição 202601**
+
+---
+
+### 💥 O detalhe crítico
+
+O pruning só acontece se:
+
+- você filtrar **diretamente pela coluna de partição**
+    
+- ou algo que o engine consiga inferir
+    
+
+---
+
+### ⚠️ Anti-pattern clássico
+
+```sql
+WHERE date_format(dt_pagamento, '%Y%m') = '202601'
+```
+
+👉 aqui você matou o pruning
+
+**Por quê?**
+
+- Athena precisa calcular `date_format` linha a linha
+    
+- ele **não consegue mapear isso direto para a partição**
+    
+
+---
+
+### ✅ Forma correta
+
+```sql
+WHERE mesref = 202601
+```
+
+ou
+
+```sql
+WHERE dt_pagamento BETWEEN DATE '2026-01-01' AND DATE '2026-01-31'
+```
+
+_(se a tabela for particionada por data compatível)_
+
+---
+
+## 🚀 2️⃣ Predicate Pushdown
+
+### 💡 Ideia simples
+
+> “Filtrar o máximo possível antes de ler os dados”
+
+---
+
+### 🔎 Onde isso acontece?
+
+#### 🔹 A) Pushdown para arquivos (Parquet)
+
+Parquet possui estatísticas:
+
+- min/max por coluna
+    
+- metadata por bloco
+    
+
+👉 Athena usa isso para **pular blocos inteiros**
+
+---
+
+##### Exemplo
+
+```sql
+WHERE valor > 1000
+```
+
+Se um bloco tem:
+
+```text
+min = 10
+max = 200
+```
+
+👉 esse bloco é ignorado
+
+---
+
+#### 🔹 B) Pushdown com Iceberg (mais poderoso)
+
+Iceberg adiciona uma camada de metadata:
+
+- arquivos organizados por snapshot
+    
+- manifest files
+    
+- estatísticas mais ricas
+    
+
+👉 Athena decide **quais arquivos nem precisam ser lidos**
+
+---
+
+### 🧊 Intuição
+
+```text
+Sem Iceberg:
+S3 → lê arquivos → filtra depois
+
+Com Iceberg:
+Metadata → escolhe arquivos → lê só o necessário
+```
+
+---
+
+## ⚠️ Onde você quebra pushdown/pruning (muito c#omum)
+
+### ❌ 1. Função na coluna de filtro
+
+```sql
+WHERE date(dt_pagamento) = DATE '2026-01-01'
+```
+
+---
+
+### ❌ 2. Cast desnecessário
+
+```sql
+WHERE CAST(mesref AS VARCHAR) = '202601'
+```
+
+---
+
+### ❌ 3. Filtro escondido em subquery/view
+
+```sql
+SELECT *
+FROM (
+    SELECT * FROM pagamentos
+) t
+WHERE mesref = 202601;
+```
+
+👉 pode impedir pushdown
+
+---
+
+### ❌ 4. View que não expõe partição
+
+Se sua view não expõe `mesref`, você perde pruning.
+
+👉 extremamente comum em times
+
+---
+
+## ✅ Boas práticas (nível engenharia)
+
+### 1️⃣ Sempre exponha partições na view
+
+```sql
+SELECT
+    mesref,
+    contrato,
+    valor
+FROM base;
+```
+
+---
+
+### 2️⃣ Sempre filtre cedo
+
+```sql
+WITH base AS (
+    SELECT *
+    FROM pagamentos
+    WHERE mesref = 202601
+)
+```
+
+---
+
+### 3️⃣ Evite funções no WHERE
+
+
+---
+
+## 🧪 Exemplos práticos
+
+### ✅ Query boa (otimizada)
+
+```sql
+WHERE dt_foto = 20260101
+```
+
+---
+
+### ❌ Query ruim (cara)
+
+```sql
+WHERE date_format(parse_datetime(dt_foto, 'yyyyMMdd'), '%Y%m') = '202601'
+```
+
+---
+
+## ⚠️ Observação prática
+
+Particionar mal também dói.
+
+---
+
+### 🚨 Problemas comuns
+
+- granularidade fina demais  
+    👉 ex: particionar por contrato (explosão de partições)
+    
+- milhões de arquivos pequenos
+    
+- chave de partição pouco usada em filtro
+    
+- partição escondida (ninguém sabe que existe)
+
+
+
+
+
+
+# 🧠 Tamanho de arquivos
+
+Boa referência prática:
+
+```text
+128MB – 512MB
+```
+
+Por quê?
+
+- muitos arquivos pequenos pioram leitura
+    
+- excesso de pequenos arquivos degrada desempenho
+    
+- manutenção fica mais difícil
+    
+
+Spark e práticas modernas de data engineering tratam bastante desse ponto.
+
+---
+
+# 🧠 Metadados e governança
+
+Usar:
+
+```text
+Glue Catalog
+```
+
+Para:
+
+```text
+schema
+localização
+acesso
+catálogo
+descoberta
+linhagem parcial
+```
+
+## Em termos simples
+
+Metadado é o “dado sobre o dado”.
+
+Exemplos:
+
+```text
+- nome da tabela
+    
+- nome da coluna
+    
+- tipo da coluna
+    
+- partição
+    
+- onde o dado mora
+    
+- quando foi atualizado
+    
+- qual processo escreveu
+    
+
+Sem metadado bom:
+
+- ninguém acha nada
+    
+- ninguém confia
+    
+- tudo vira “tabela misteriosa”
+    
+```
+
+No lakehouse, governança não é luxo. É o que impede o ambiente de virar um depósito de arquivos sem contexto.
+
+---
+
+# 🧱 SCD2 (histórico de mudanças) com incremental por partição
+
+Relacionado a: [[SCD2]]
+
+---
+
+## Problema
+
+> Se você só faz `UPDATE`, você perde o histórico.
+
+---
+
+## Exemplo prático
+
+Situação inicial:
+
+```text
+id_cliente = 100
+segmento = Empreenda
+```
+
+Depois:
+
+```text
+id_cliente = 100
+segmento = Top
+```
+
+Se fizer só:
+
+```sql
+UPDATE tabela SET segmento = 'Top'
+```
+
+Você apaga o passado.
+
+---
+
+## Com SCD2
+
+|id_cliente|segmento|dt_inicio_vigencia|dt_fim_vigencia|fl_ativo|
+|---|---|---|---|---|
+|100|Empreenda|2024-01-01|2024-01-19|false|
+|100|Top|2024-01-20|9999-12-31|true|
+
+Essa lógica bate com o conceito clássico de **Type 2: add new row**, tratado por Kimball.
+
+---
+
+## Estrutura da tabela
+
+```sql
+CREATE TABLE workspace_db.gold_cliente_segmentacao_scd2 (
+    id_cliente string,
+    segmento string,
+    dt_inicio_vigencia date,
+    dt_fim_vigencia date,
+    fl_ativo boolean,
+    data_particao int,
+    dt_carga timestamp
+)
+WITH (
+    table_type = 'ICEBERG',
+    format = 'PARQUET',
+    partitioning = ARRAY['data_particao'],
+    location = 's3://lakehouse/gold/cobranca/cliente_segmentacao_scd2/'
+);
+```
+
+---
+
+## Regra incremental
+
+> O SCD2 não precisa olhar o histórico inteiro sempre.  
+> Ele deve olhar o trecho que pode ter mudado.
+
+---
+
+## Passo 1 — descobrir última partição
+
+```sql
+SELECT COALESCE(MAX(data_particao), 0) AS ultima_particao
+FROM workspace_db.gold_cliente_segmentacao_scd2;
+```
+
+---
+
+## Passo 2 — filtrar origem incremental
+
+```sql
+WITH ultima_particao AS (
+    SELECT COALESCE(MAX(data_particao), 0) AS ultima_particao
+    FROM workspace_db.gold_cliente_segmentacao_scd2
+),
+
+origem_incremental AS (
+    SELECT
+        id_cliente,
+        segmento,
+        data_particao,
+        current_date AS dt_inicio_vigencia,
+        current_timestamp AS dt_carga
+    FROM workspace_db.silver_cliente_segmentacao s
+    CROSS JOIN ultima_particao u
+    WHERE s.data_particao >= u.ultima_particao
+)
+```
+
+---
+
+## Passo 3 — comparar com o registro ativo
+
+```sql
+, comparacao AS (
+    SELECT
+        o.id_cliente,
+        o.segmento AS segmento_novo,
+        t.segmento AS segmento_atual,
+        o.data_particao,
+        o.dt_inicio_vigencia,
+        o.dt_carga
+    FROM origem_incremental o
+    LEFT JOIN workspace_db.gold_cliente_segmentacao_scd2 t
+        ON o.id_cliente = t.id_cliente
+       AND t.fl_ativo = true
+)
+```
+
+---
+
+## Passo 4 — aplicar SCD2 com MERGE
+
+### ⚠️ Observação importante
+
+A forma mais segura e legível de implementar SCD2 no Athena nem sempre é um único `MERGE` “mágico”. Muitas vezes fica mais robusto fazer em **duas etapas**:
+
+1. fechar registros ativos que mudaram
+    
+2. inserir nova versão
+    
+
+Isso costuma ser mais claro e menos sujeito a bug lógico.
+
+---
+
+## Opção didática e robusta: duas etapas
+
+### Etapa A — fechar o registro ativo anterior
+
+```sql
+MERGE INTO workspace_db.gold_cliente_segmentacao_scd2 AS destino
+USING (
+    WITH ultima_particao AS (
+        SELECT COALESCE(MAX(data_particao), 0) AS ultima_particao
+        FROM workspace_db.gold_cliente_segmentacao_scd2
+    ),
+    origem_incremental AS (
+        SELECT
+            id_cliente,
+            segmento,
+            data_particao,
+            current_date AS dt_inicio_vigencia
+        FROM workspace_db.silver_cliente_segmentacao s
+        CROSS JOIN ultima_particao u
+        WHERE s.data_particao >= u.ultima_particao
+    )
+    SELECT
+        o.id_cliente,
+        o.segmento,
+        o.data_particao,
+        o.dt_inicio_vigencia
+    FROM origem_incremental o
+    INNER JOIN workspace_db.gold_cliente_segmentacao_scd2 t
+        ON o.id_cliente = t.id_cliente
+       AND t.fl_ativo = true
+    WHERE o.segmento <> t.segmento
+) AS origem
+ON destino.id_cliente = origem.id_cliente
+AND destino.fl_ativo = true
+
+WHEN MATCHED THEN
+UPDATE SET
+    dt_fim_vigencia = origem.dt_inicio_vigencia - INTERVAL '1' DAY,
+    fl_ativo = false;
+```
+
+### Etapa B — inserir a nova versão
+
+```sql
+INSERT INTO workspace_db.gold_cliente_segmentacao_scd2 (
+    id_cliente,
+    segmento,
+    dt_inicio_vigencia,
+    dt_fim_vigencia,
+    fl_ativo,
+    data_particao,
+    dt_carga
+)
+WITH ultima_particao AS (
+    SELECT COALESCE(MAX(data_particao), 0) AS ultima_particao
+    FROM workspace_db.gold_cliente_segmentacao_scd2
+),
+origem_incremental AS (
+    SELECT
+        id_cliente,
+        segmento,
+        data_particao,
+        current_date AS dt_inicio_vigencia,
+        current_timestamp AS dt_carga
+    FROM workspace_db.silver_cliente_segmentacao s
+    CROSS JOIN ultima_particao u
+    WHERE s.data_particao >= u.ultima_particao
+),
+comparacao AS (
+    SELECT
+        o.id_cliente,
+        o.segmento AS segmento_novo,
+        t.segmento AS segmento_atual,
+        o.data_particao,
+        o.dt_inicio_vigencia,
+        o.dt_carga
+    FROM origem_incremental o
+    LEFT JOIN workspace_db.gold_cliente_segmentacao_scd2 t
+        ON o.id_cliente = t.id_cliente
+       AND t.fl_ativo = true
+)
+SELECT
+    id_cliente,
+    segmento_novo AS segmento,
+    dt_inicio_vigencia,
+    DATE '9999-12-31' AS dt_fim_vigencia,
+    true AS fl_ativo,
+    data_particao,
+    dt_carga
+FROM comparacao
+WHERE segmento_atual IS NULL
+   OR segmento_novo <> segmento_atual;
+```
+
+---
+
+## Fluxo mental completo
+
+```text
+Descobre última partição
+ ↓
+Filtra origem (>= última partição)
+ ↓
+Compara com registro ativo
+ ↓
+Se mudou:
+    fecha o antigo
+    insere o novo
+Se não mudou:
+    não faz nada
+```
+
+---
+
+## Benefícios
+
+- evita reprocessar tudo
+    
+- mantém histórico temporal
+    
+- funciona bem com Iceberg
+    
+- reduz custo
+    
+- captura correção retroativa recente
+    
+
+---
+
+## ⚠️ Cuidados importantes
+
+### 1. Janela pode ser pequena demais
+
+Se o dado chega muito atrasado, usar só `>= ultima_particao` pode não bastar.
+
+Às vezes é melhor:
+
+```text
+>= ultima_particao - N dias
+```
+
+### 2. SCD2 exige chave de negócio bem definida
+
+Exemplo:
+
+```text
+id_cliente
+```
+
+Mas talvez o negócio real seja:
+
+```text
+id_cliente + tipo_relacao
+```
+
+### 3. SCD2 não substitui boa modelagem
+
+Antes de criar histórico, confirme:
+
+- esse atributo realmente precisa de histórico?
+    
+- quem vai usar?
+    
+- qual pergunta de negócio isso responde?
+    
+
+Nem todo atributo merece SCD2.
+
+---
+
+# 🧠 Modelagem dimensional dentro do lakehouse
+
+O padrão medallion **não substitui** modelagem dimensional.
+
+Na prática:
+
+- Bronze organiza entrada
+    
+- Silver estrutura confiança
+    
+- Gold pode conter **fatos**, **dimensões**, **snapshots**, **métricas**
+    
+
+Então uma combinação saudável pode ser:
+
+```text
+Bronze = ingestão e preservação
+Silver = normalização / integração / padronização
+Gold = modelo analítico e semântico
+Mart = consumo final
+```
+
+E dentro da Gold você pode ter:
+
+- fato transacional
+    
+- snapshot periódico
+    
+- snapshot acumulado
+    
+- dimensão SCD2
+    
+
+---
+
+# 🧠 Estrutura ideal final
+
+```text
+lakehouse/
+
+bronze/
+silver/
+gold/
+mart/
+
+catalog/
+orchestration/
+monitoring/
+auditoria/
+```
+
+Essa separação ajuda a mostrar que o lakehouse não é só tabela.
+
+Ele também precisa de:
+
+- catálogo
+    
+- orquestração
+    
+- monitoramento
+    
+- auditoria
+    
+- governança
+    
+
+---
+
+# 🚀 Arquitetura madura
+
+```text
+S3
++
+Iceberg
++
+Glue Catalog
++
+Athena
++
+Step Functions
++
+EventBridge
+```
+
+Isso forma um **lakehouse serverless** bem coerente para analytics.
+
+Em termos simples, você junta:
+
+- storage escalável
+    
+- tabela moderna
+    
+- catálogo central
+    
+- SQL serverless
+    
+- automação
+    
+- agendamento
+    
+
+Resultado:
+
+> uma arquitetura moderna, modular e relativamente simples de operar para uso analítico.
+
+---
+
+# 🧠 Regra final
+
+> Lakehouse não é só jogar arquivo no S3 e consultar com Athena.
+
+Lakehouse de verdade envolve:
+
+- organização em camadas
+    
+- metadados
+    
+- padrão de ingestão
+    
+- incremental confiável
+    
+- histórico quando necessário
+    
+- modelo de consumo claro
+    
+- governança
+    
+- orquestração
+    
+
+---
+
+# 📌 Resumo executivo
+
+- **Bronze** preserva entrada
+    
+- **Silver** padroniza e confere confiança
+    
+- **Gold** representa negócio
+    
+- **Mart** simplifica consumo
+    
+- **Glue Catalog** guarda metadados
+    
+- **Iceberg** habilita MERGE, ACID e incremental robusto
+    
+- **Athena** processa com SQL direto no S3
+    
+- **Step Functions** organiza a execução
+    
+- **EventBridge** agenda e dispara
+    
+- **SCD2** entra quando você precisa preservar histórico de atributo
+    
+- **grain, chave e partição** são decisões centrais, não detalhes
+    
+A ideia é montar um modelo de dados que vai servir para processos como:
+- Pagadoria ADM
+- Pagadoria JUD
+- Ajuizamento
+- Apuração de Carteira
+
+Entre outros processos.
+
+Eu usarei os seguintes elementos na stack para isso:
+
+- **S3** -> storage
+- **Athena** -> computação em SQL
+- **Glue Catalog** -> catálogo de metadados
+- **Iceberg** (embutido no Athena) -> formato de tabela
+- **Step Functions** -> orquestração
+- **EventBridge** -> agendamento e disparos
+
+A arquitetura segue o padrão **Medallion (Bronze → Silver → Gold)**, muito usado em plataformas [[Lakehouse]], que são plataformas que juntam dados desde a origem ao tratamento.
+
+---
+## Contexto
+
+
+Em termos simples, a ideia é criar um fluxo em que os dados:
+
+- entram de forma mais bruta, como arquivos Excel em formato CSV ou tabelas pré processadas, vindos de outras equipes
+    
+- passam por organização e limpeza
+    
+- ganham estrutura e confiança
+    
+- depois viram tabelas prontas para consumo analítico
+    
+
+Estrutura básica:
+
+```text
+Fontes
+   ↓
+Bronze : Tabelas com pouca ou nenhuma modificação
+   ↓
+Silver : Aplicação de regras de tratamento e de negócio
+   ↓
+Gold : Seleção, filtro de dados e construção de campos de negócio
+   ↓
+Consumo : Alimento de Relatórios e Dashboards 
+```
+---
+ A ideia dessa arquitetura é juntar a rapidez de "só subir" os dados com a segurança de ter os dados tratados e disponíveis no melhor formato, **evoluindo a qualidade** entre as camadas
+ ---
+
+# 🧱 Arquitetura alvo / estrutura na prática
+
+```text
+Fontes 
+  │
+  ▼
+Ingestão (Glue / SQL de Consulta / upload manual de Excel CSV)
+  │
+  ▼
+S3 Bronze
+  │
+  ▼
+Athena Transform
+  │
+  ▼
+S3 Silver
+  │
+  ▼
+Athena MERGE
+  │
+  ▼
+Athena + Iceberg Gold
+  │
+  ▼
+Mart / QuickSight / consumo analítico
+```
+
+Em termos simples:
+
+- os dados chegam de alguma fonte
+    
+- entram no **Bronze** quase como vieram
+    
+- passam por transformações no **Athena**
+    
+- viram dados mais confiáveis na **Silver**
+    
+- depois são refinados para consumo na **Gold**
+    
+- por fim, alimentam dashboards, relatórios, análises e data marts
+    
+
+---
+
+# 🧱 Estrutura do Data Lake
+
+Criar a estrutura no S3.
+
+```text
+s3://lakehouse/
+
+    bronze/
+        cobranca/
+            boletos/
+            pagamentos/
+
+    silver/
+        cobranca/
+            contratos/
+            parcelas/
+
+    gold/
+        cobranca/
+            carteira_snapshot/
+            rollrate/
+
+    mart/
+        cobranca/
+            dashboards/
+
+    ops/
+        athena_results/
+        logs/
+        auditoria/
+```
+
+Essa organização ajuda a deixar claro:
+
+- em que camada cada dado está
+    
+- qual é o nível de tratamento daquele dado
+    
+- onde procurar cada tipo de informação
+    
+- onde ficam os artefatos operacionais da pipeline, caso existam
+    
+
+---
+
+# 🧠 O que cada componente faz
+
+## **S3**
+
+É o armazenamento base.
+
+Em termos simples:
+
+- é onde os arquivos e tabelas ficam fisicamente
+    
+- escala bem ("quase" ilimitado)
+
+---
+
+## **Athena**
+
+É o motor SQL .
+
+O Athena serve para consultar dados diretamente no S3 com SQL e integra com Glue Data Catalog, Iceberg e QuickSight.
+
+Em termos simples:
+
+- você escreve SQL
+    
+- o Athena lê os dados no S3
+    
+- processa
+    
+- devolve resultado
+    
+- e cobra por uso
+    
+
+---
+
+## **Glue Catalog**
+
+É o catálogo de metadados.
+
+Em termos simples:
+
+- guarda definição de banco, tabela, colunas, partições e localização
+    
+- ajuda o Athena a “entender” o que existe no S3
+    
+- funciona como um dicionário central dos dados
+    
+
+### **Exemplo 1 — Listar tabelas do database**
+
+```sql
+SELECT *  
+FROM information_schema.tables  
+WHERE table_schema = 'workspace_db';
+```
+
+#### 🧠 Resultado típico
+
+| table_schema | table_name        | table_type     |
+| ------------ | ----------------- | -------------- |
+| workspace_db | bronze_pagamentos | EXTERNAL_TABLE |
+| workspace_db | silver_pagamentos | BASE_TABLE     |
+| workspace_db | gold_carteira     | BASE_TABLE     |
+|              |                   |                |
+
+
+#### 🧠 Explicando
+
+- `table_schema` → database (Glue)
+- `table_name` → nome da tabela
+- `table_type` → tipo (Iceberg aparece como BASE_TABLE)
+
+---
+
+### **🧱 Exemplo 2 — Ver colunas de uma tabela**
+
+```sql 
+SELECT *  
+FROM information_schema.columns  
+WHERE table_schema = 'workspace_db'  
+  AND table_name = 'silver_pagamentos';
+
+```
+
+#### 🧠 **Resultado**
+
+| column_name    | data_type | ordinal_position |
+| -------------- | --------- | ---------------- |
+| contrato_id    | varchar   | 1                |
+| valor          | double    | 2                |
+| data_pagamento | date      | 3                |
+| data_particao  | integer   | 4                |
+| dt_carga       | timestamp | 5                |
+
+#### 🧠 **Explicando**
+
+- `column_name` → nome da coluna
+- `data_type` → tipo no Athena
+- `ordinal_position` → ordem da coluna
+
+👉 Isso vem direto do Glue Catalog
+
+
+
+---
+
+## **Iceberg**
+
+É o formato moderno de tabela.
+
+Ele adiciona uma camada de controle sobre os arquivos no S3, transformando um conjunto de arquivos Parquet em uma **tabela com comportamento semelhante a um banco de dados**.
+
+Isso resolve limitações importantes que o Parquet sozinho não cobre bem, como:
+
+
+---
+
+- **MERGE / UPDATE / DELETE**
+
+Permite modificar dados diretamente na tabela.
+
+👉 Exemplo - Aqui a partir da tabela/cte "nova_carga", ele verifica se o contrato estava presente na tabela "silver_pagamentos", se sim, atualiza com o  novo valor, se não, insere novos dados.
+
+```sql
+MERGE INTO silver_pagamentos t  
+USING nova_carga s  
+ON t.contrato_id = s.contrato_id  
+  
+WHEN MATCHED THEN UPDATE SET valor = s.valor  
+WHEN NOT MATCHED THEN INSERT VALUES (...);
+```
+Sem Iceberg, isso exigiria recriar arquivos inteiros.
+
+---
+
+- **Controle de snapshots (versionamento)**
+
+Cada alteração na tabela gera uma nova versão (snapshot).
+
+Isso significa que o Iceberg mantém um histórico completo do estado da tabela ao longo do tempo — como se fosse um **“git dos dados”**.
+
+👉 Exemplo:
+
+SELECT * FROM silver_pagamentos$snapshots;
+
+Você consegue ver:
+
+- quando a tabela mudou
+- qual operação gerou a mudança (INSERT, MERGE, DELETE)
+- quantos arquivos foram afetados
+- e o **snapshot_id** de cada versão
+
+---
+
+### 🔎 Como usar isso na prática
+
+👉 Ver histórico de mudanças:
+
+```sql
+SELECT *  
+FROM silver_pagamentos$history;
+```
+---
+
+👉 Consultar a tabela em um ponto específico do passado (sem alterar nada):
+
+```sql
+SELECT *  
+FROM silver_pagamentos  
+FOR VERSION AS OF 949530903748831860;
+```
+ou por data:
+
+```sql
+SELECT *  
+FROM silver_pagamentos  
+FOR TIMESTAMP AS OF TIMESTAMP '2026-03-30 10:00:00 UTC';
+```
+---
+
+### 🔄 “Control Z” na prática
+
+Iceberg permite voltar no tempo — mas no Athena isso funciona em dois níveis:
+
+#### 1. **Consultar o passado (seguro)**
+
+Você só lê os dados como eram antes:
+
+```sql
+SELECT *  
+FROM silver_pagamentos  
+FOR VERSION AS OF <snapshot_id>;
+```
+---
+
+#### 2. **Restaurar o passado (manual, porém poderoso)**
+
+Você recria a tabela a partir de uma versão antiga:
+
+```sql
+CREATE TABLE silver_pagamentos_restaurada  
+WITH (table_type = 'ICEBERG')  
+AS  
+SELECT *  
+FROM silver_pagamentos  
+FOR VERSION AS OF <snapshot_id>;
+```
+---
+3. **Restaurar o passado (manual, opção mais rápida, mas que precisa ser feita com cuidado)**
+
+Você deleta os dados e insere de novo a partir de um certo momento.
+
+**Mas, é importante garantir que haja o snapshot anterior salvo**
+
+É parecido com fazer um "Control Z" ou como desligar o videogame e voltar no save.
+
+Mas para isso é importante garantir que exista um "save".
+
+```sql
+--- Execute primeiro
+DELETE FROM workspace_db.silver_pagamentos;  
+  
+
+--- Execute depois  
+INSERT INTO workspace_db.silver_pagamentos  
+SELECT *  
+FROM workspace_db.silver_pagamentos  
+FOR VERSION AS OF 949530903748831860;
+```
+
+### ⚠️ Cuidados importantes
+
+- sem snapshot → sem “voltar no tempo”
+- sempre valide antes de restaurar (ideal criar tabela paralela)
+
+---
+
+### 💡 Insight de engenharia (alto valor)
+
+Esse controle de snapshots é o que permite:
+
+- pipelines incrementais confiáveis
+- reprocessamento seguro
+- auditoria de mudanças
+- rollback em caso de erro
+
+👉 É literalmente o que transforma um data lake em algo próximo de um banco transacional.
+
+
+---
+
+- **Evolução de schema**
+
+Permite alterar a estrutura da tabela sem quebrar dados antigos.
+
+👉 Exemplo:
+
+ALTER TABLE silver_pagamentos  
+ADD COLUMN canal_pagamento VARCHAR;
+
+Dados antigos continuam válidos, mesmo sem essa coluna.
+
+---
+
+No Athena, Iceberg suporta operações como:
+
+- **MERGE INTO** → atualizar e inserir dados na mesma operação
+- **UPDATE / DELETE** → modificar dados existentes
+- **CTAS com Iceberg** → criar tabelas já com suporte a versionamento e incremental
+
+
+---
+
+**Resumo prático:**
+
+> Parquet organiza arquivos  
+> Iceberg organiza a tabela inteira (com histórico, controle e atualização segura)
+
+---
+
+## **Step Functions**
+
+É a orquestração do fluxo. Como se fosse o maestro, que faz com que cada músico toque corretamente, de forma coordenada.
+
+Em termos simples:
+
+- decide a ordem das etapas
+    
+- chama queries Athena
+    
+- chama jobs Glue
+    
+- trata erros
+    
+- permite organizar o fluxo de execução
+
+---
+
+## **EventBridge**
+
+É o gatilho, que funciona como se fosse um "Se -> Então", por exemplo, se for 12h00 então execute isso.
+
+Em termos simples:
+
+- agenda execução
+    
+- dispara fluxo por horário   
+
+---
+
+# 🧱 Passo 1 (Não se aplica) — Criar o database
+
+> [!Explicação]  
+> Observação: **não se aplica no seu cenário atual**, porque, por convenção, tudo está sendo salvo no `workspace_db`.
+
+No Athena:
+
+```sql
+CREATE DATABASE lakehouse
+LOCATION 's3://lakehouse/';
+```
+
+Esse passo aparece mais como referência conceitual.
+
+Na prática, se no seu ambiente o database padrão já é o `workspace_db`, você pode seguir nele. O ponto mais importante aqui não é o nome do database, e sim:
+
+- organização
+    
+- padronização
+    
+- governança
+    
+- clareza de propósito
+    
+
+---
+
+# 🧱 Passo 2 — Criar tabela Bronze
+
+A camada Bronze normalmente tem estas características:
+
+- formato como **Parquet**, CSV ou outro formato de entrada
+    
+- comportamento **append-oriented**, ou seja, apenas novas inserções por padrão.
+    
+- poucas regras de negócio
+    
+- estrutura próxima da origem
+    
+- preservação do máximo possível do dado recebido
+    
+
+Em outras palavras:
+
+- o Bronze guarda o dado quase como ele chegou
+    
+- ele não é a camada “bonita”
+    
+- ele é a base de entrada do pipeline
+    
+
+Não é que “nunca pode mudar”, e sim que **o padrão saudável é preservar a entrada**.
+
+---
+
+## Criar tabelas ainda sem dados
+
+```sql
+CREATE TABLE lakehouse.bronze_pagamentos
+WITH (
+    format = 'PARQUET',
+    external_location = 's3://lakehouse/bronze/cobranca/pagamentos/'
+) AS
+SELECT
+    CAST(NULL AS VARCHAR)  AS contrato_id,
+    CAST(NULL AS DOUBLE)   AS valor,
+    CAST(NULL AS DATE)     AS data_pagamento,
+    CAST(NULL AS INTEGER)  AS anomesdia
+WHERE 1 = 0;
+```
+
+Esse padrão cria a estrutura da tabela mesmo sem carregar nenhuma linha.
+
+É útil quando você quer:
+
+- preparar a camada antes da carga
+    
+- definir o schema
+    
+- deixar a tabela pronta para receber dados depois
+    
+
+No Athena, isso é um uso comum de **CTAS**. A documentação cobre CTAS como forma de criar tabela a partir de query.
+
+---
+
+## Criar tabelas a partir de outra tabela
+
+```sql
+CREATE TABLE lakehouse.bronze_pagamentos
+WITH (
+    format = 'PARQUET',
+    external_location = 's3://lakehouse/bronze/cobranca/pagamentos/'
+) AS
+SELECT
+    CAST(contrato_id AS VARCHAR)      AS contrato_id,
+    CAST(valor AS DOUBLE)             AS valor,
+    CAST(data_pagamento AS DATE)      AS data_pagamento,
+    CAST(anomesdia AS INTEGER)        AS anomesdia
+FROM lakehouse.tabela_exemplo;
+```
+
+Esse padrão é útil quando o dado já existe em outra tabela e você quer montar rapidamente uma camada Bronze.
+
+O objetivo aqui é manter:
+
+- histórico completo
+    
+- schema próximo ao original
+    
+
+Ou seja:
+
+- não transformar demais
+    
+- não aplicar regras pesadas
+    
+- apenas trazer o dado para a estrutura Bronze
+    
+
+---
+
+## Criar tabelas a partir de um Excel
+
+O Athena **não lê `.xlsx` diretamente** como tabela.
+
+Ou seja: não dá para simplesmente subir um Excel no S3 e sair consultando como se já fosse tabela.
+
+### 💡 Então qual é o caminho?
+
+Se você recebe arquivos Excel, o fluxo ideal é:
+
+- receber o Excel
+    
+- converter para **CSV** usando o [[código de conversão de excel para csv]]
+    
+- subir o CSV no S3 Bronze
+    
+- registrar tabela no Athena via Create Table
+    
+
+Exemplo:
+
+```text
+s3://lakehouse/bronze/cobranca/pagamentos_excel/
+```
+
+Em termos simples:
+
+> o Excel é o arquivo de entrada, mas o arquivo que o Athena realmente vai ler precisa estar em um formato simples e previsível.
+
+---
+
+### 🧱 Criando a tabela no Athena a partir de arquivo CSV
+
+Se o CSV estiver separado por `|`:
+
+```sql
+CREATE EXTERNAL TABLE workspace_db.bronze_pagamentos_excel (
+    contrato_id string,
+    valor double,
+    data_pagamento date,
+    anomesdia int
+)
+ROW FORMAT SERDE 'org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe'
+WITH SERDEPROPERTIES (
+    'field.delim' = '|',
+    'skip.header.line.count' = '1'
+)
+STORED AS TEXTFILE
+LOCATION 's3://lakehouse/bronze/cobranca/pagamentos_excel/';
+```
+
+Essa definição diz para o Athena:
+
+- onde está o arquivo
+    
+- como ele deve ser lido
+    
+- qual separador foi usado
+    
+- quais são as colunas e seus tipos
+    
+
+A documentação do Athena cobre criação de tabelas com SerDes e uso de CSV/texto.
+
+---
+
+### 🧠 Explicando em termos simples
+
+#### `ROW FORMAT SERDE`
+
+Define como o Athena interpreta o arquivo.
+
+#### `'field.delim' = '|'`
+
+Diz que as colunas estão separadas por `|`.
+
+#### `'skip.header.line.count' = '1'`
+
+Ignora a primeira linha, que normalmente é cabeçalho.
+
+#### `STORED AS TEXTFILE`
+
+Informa que o arquivo é texto.
+
+#### `LOCATION`
+
+Aponta para a pasta do S3.
+
+---
+
+### ⚠️ Erros comuns
+
+#### ❌ Esquecer o delimiter
+
+O Athena pode ler a linha inteira como uma única coluna.
+
+#### ❌ Não ignorar o header
+
+O nome da coluna vira dado.
+
+#### ❌ Tipos errados
+
+Valor mal formatado vira `NULL` ou distorce análise.
+
+#### ❌ Misturar arquivos incompatíveis na mesma pasta
+
+Se um arquivo tiver estrutura diferente, a tabela pode passar a ler lixo.
+
+---
+
+### 🧪 Teste rápido
+
+```sql
+SELECT *
+FROM workspace_db.bronze_pagamentos_excel
+LIMIT 10;
+```
+
+Verifique:
+
+- se as colunas estão separadas corretamente
+    
+- se datas foram lidas como datas
+    
+- se valores fazem sentido
+    
+
+---
+
+### 🔄 Fluxo simplificado
+
+```text
+Excel (.xlsx)
+   ↓
+Conversão para CSV
+   ↓
+Upload no S3 Bronze
+   ↓
+Athena lê como tabela
+```
+
+---
+
+# 🧱 Passo 3 — Ingestão Bronze
+
+A carga para o Bronze pode vir de diferentes formas.
+
+### Exemplos comuns
+
+- **Glue Job**
+    
+- **outra tabela já existente**
+    
+- **upload manual**
+    
+- **API / extração batch**
+    
+- **evento agendado**
+    
+
+---
+
+## 🔄 Exemplos práticos
+
+### 🔹 1. Via Glue Job
+
+```text
+Fonte → transformação leve → Parquet → S3 Bronze
+```
+
+Usado quando:
+
+- há integração recorrente
+    
+- existe pipeline estruturado
+    
+- volume é maior
+    
+- o processo precisa rodar sozinho
+     
+- existe uma complexidade necessária maior
+
+Exemplo: 
+Tem que ler vários arquivos de Excel para obter informações e com essas informações, fazer cálculos.
+
+
+
+
+---
+
+### **🔹 2. A partir de outra tabela**
+
+```text
+Tabela origem → SELECT → CTAS → Bronze
+```
+
+```sql
+CREATE TABLE workspace_db.bronze_pagamentos
+WITH (
+    format = 'PARQUET',
+    external_location = 's3://lakehouse/bronze/cobranca/pagamentos/'
+) AS
+SELECT *
+FROM workspace_db.tabela_origem;
+```
+
+---
+
+### **🔹 3. Upload manual**
+
+```text
+Excel → CSV → upload S3 → Athena
+```
+
+Usado quando:
+
+- o processo é manual
+    
+- o arquivo chega por e-mail
+    
+- a carga é pontual ou mensal
+    
+- ainda não existe automação
+    
+
+---
+
+## 🧠 Papel do Bronze
+
+Independentemente da origem, o Bronze deve buscar:
+
+- **histórico**
+    
+- **mínima transformação**
+    
+- **proximidade com a origem**
+    
+- **rastreamento da carga**
+    
+
+Boa prática:
+
+- adicionar colunas como `dt_ingestao`, `arquivo_origem`, `id_execucao`, `sistema_origem` caso sejam aplicáveis.
+    
+
+Isso ajuda muito em:
+
+- auditoria
+    
+- Resolver problemas (troubleshooting)
+    
+- reconciliação
+    
+- reprocessamento
+    
+
+---
+
+# 🧱 Passo 4 — Criar tabela Silver
+
+A camada Silver já representa um dado **confiável e padronizado**.
+
+Ela resolve problemas comuns da Bronze:
+
+- tipos inconsistentes
+    
+- registros inválidos
+    
+- duplicidade
+    
+- colunas fora do padrão
+    
+- pequenas harmonizações entre fontes
+    
+
+Em outras palavras:
+
+> Silver é a camada em que o dado deixa de ser apenas “legível” e passa a ser “confiável”.
+
+
+---
+
+## O que a Silver deve garantir
+
+- tipagem correta
+    
+- dados válidos
+    
+- deduplicação
+    
+- padronização
+    
+- regras básicas de negócio
+    
+- granularidade clara
+    
+
+### ⚠️ Ponto crítico: **grain**
+
+Antes de modelar a Silver, defina o **grão**.
+
+Exemplo:
+
+> uma linha representa o quê?
+
+- um pagamento?
+    
+- uma parcela?
+    
+- um contrato por dia?
+    
+- um contrato por mês?
+    
+- um cliente por status?
+    
+
+Nos livros de modelagem dimensional, **grain** é uma das decisões mais importantes do modelo, por exemplo, na base de pagadoria, o grão é, por contrato + produto + dia + valor + origem + boleto (se houver boleto), então não deveria haver duplicidade neste nível
+
+---
+
+## Exemplo mais completo
+
+```sql
+CREATE TABLE lakehouse.silver_pagamentos
+WITH (
+    table_type = 'ICEBERG',
+    format = 'PARQUET',
+    location = 's3://lakehouse/silver/cobranca/pagamentos/'
+)
+AS
+WITH base AS (
+
+    SELECT
+        CAST(contrato_id AS VARCHAR) AS contrato_id,
+        CAST(valor AS DOUBLE) AS valor,
+        TRY_CAST(data_pagamento AS DATE) AS data_pagamento,
+        CAST(anomesdia AS INTEGER) AS anomesdia,
+
+        ROW_NUMBER() OVER (
+            PARTITION BY contrato_id, data_pagamento, valor
+            ORDER BY anomesdia DESC
+        ) AS rn
+
+    FROM lakehouse.bronze_pagamentos
+
+),
+
+filtrado AS (
+
+    SELECT *
+    FROM base
+    WHERE
+        valor > 0
+        AND data_pagamento IS NOT NULL
+        AND contrato_id IS NOT NULL
+
+),
+
+deduplicado AS (
+
+    SELECT *
+    FROM filtrado
+    WHERE rn = 1
+
+)
+
+SELECT
+    contrato_id,
+    valor,
+    data_pagamento,
+    anomesdia
+FROM deduplicado;
+```
+
+---
+
+## 🧠 O que melhoramos aqui
+
+### 1. Tipagem defensiva
+
+```sql
+TRY_CAST(data_pagamento AS DATE)
+```
+
+Evita que a pipeline quebre por causa de data inválida.
+Precisa ser usada com cuidado por que pode mascarar erros
+
+---
+
+### 2. Deduplicação
+
+```sql
+ROW_NUMBER() OVER (...)
+```
+
+Mantém só a linha mais adequada segundo a regra definida.
+
+---
+
+### 3. Filtro de qualidade
+
+```sql
+valor > 0
+data_pagamento IS NOT NULL
+```
+
+Impede "lixo" evidente de avançar.
+
+---
+
+### 4. Separação por etapas
+
+```text
+base → filtrado → deduplicado
+```
+
+Melhora leitura, debug e manutenção.
+
+---
+
+## 🎯 Regra prática
+
+> Bronze = dado como veio  
+> Silver = dado confiável  
+> Gold = dado interpretado pelo negócio
+
+---
+
+# 🧱 Passo 5 — Incremental na Silver
+
+Quando o volume cresce, não faz sentido reprocessar tudo sempre.
+
+Isso é:
+
+- mais lento
+    
+- mais caro
+    
+- mais difícil de manter
+    
+
+## Ideia principal
+
+> processar apenas o que é novo ou o que pode ter mudado
+
+---
+
+## Primeira abordagem: simples, mas limitada
+
+```sql
+INSERT INTO lakehouse.silver_pagamentos
+SELECT *
+FROM lakehouse.bronze_pagamentos
+WHERE anomesdia >= 20240101;
+```
+
+Funciona no começo, mas depende de manutenção manual.
+
+---
+
+## Abordagem um pouco melhor: baseada no que já foi carregado
+
+```sql
+INSERT INTO lakehouse.silver_pagamentos
+SELECT *
+FROM lakehouse.bronze_pagamentos
+WHERE anomesdia > (
+    SELECT COALESCE(MAX(anomesdia), 0)
+    FROM lakehouse.silver_pagamentos
+);
+```
+
+Olha a última data já carregada e busca só o que veio depois.
+
+---
+
+## ⚠️ Limitações do INSERT incremental
+
+Esse modelo:
+
+- só insere
+    
+- não corrige linha antiga
+    
+- não lida bem com dado atrasado
+    
+- não resolve bem alteração retroativa
+    
+
+---
+
+## Evolução correta: MERGE com Iceberg
+
+Para isso, usamos **MERGE**.
+
+No Athena com Iceberg, `MERGE INTO` permite combinar inserção, atualização e exclusão em uma operação transacional.
+
+```sql
+MERGE INTO lakehouse.silver_pagamentos AS destino
+USING (
+
+    SELECT
+        contrato_id,
+        valor,
+        TRY_CAST(data_pagamento AS DATE) AS data_pagamento,
+        anomesdia
+    FROM lakehouse.bronze_pagamentos
+    WHERE anomesdia >= (
+        SELECT COALESCE(MAX(anomesdia), 0) - 7
+        FROM lakehouse.silver_pagamentos
+    )
+
+) AS origem
+
+ON destino.contrato_id = origem.contrato_id
+AND destino.data_pagamento = origem.data_pagamento
+
+WHEN MATCHED THEN
+    UPDATE SET
+        valor = origem.valor,
+        anomesdia = origem.anomesdia
+
+WHEN NOT MATCHED THEN
+    INSERT (
+        contrato_id,
+        valor,
+        data_pagamento,
+        anomesdia
+    )
+    VALUES (
+        origem.contrato_id,
+        origem.valor,
+        origem.data_pagamento,
+        origem.anomesdia
+    );
+```
+
+---
+
+## 🧠 O que esse MERGE faz
+
+- se o registro já existe → atualiza
+    
+- se não existe → insere
+    
+
+E ainda:
+
+- reprocessa uma **janela de segurança**
+    
+- reduz risco de perder dado atrasado
+    
+- evita parte da duplicidade
+    
+
+---
+
+## 🎯 Chave do MERGE
+
+A chave define o que é “o mesmo registro”.
+
+Exemplo:
+
+```text
+contrato_id + data_pagamento
+```
+
+Mas, no mundo real, isso precisa refletir o **grão real**. Muitas vezes, no seu contexto, algo como:
+
+```text
+contrato + produto + data + valor
+```
+
+é mais seguro.
+
+---
+
+## ⚠️ Cuidados
+
+### 1. Só funciona de verdade com Iceberg
+
+Parquet sozinho não te dá essa mesma capacidade transacional.
+
+### 2. MERGE é mais pesado que INSERT, ou seja, demora mais.
+
+Custa mais, mas é mais confiável.
+
+### 3. A chave precisa ser boa
+
+Se a chave estiver errada:
+
+- duplica
+    
+- sobrescreve errado
+    
+- gera inconsistência silenciosa
+    
+
+### 4. Janela curta demais pode perder ajuste retroativo
+
+Às vezes `-7` dias basta.  
+Às vezes o seu processo exige `-30` ou até reprocessar o mês aberto.
+
+---
+
+# 🧱 Passo 6 — Reprocessamento inteligente sem tabela de controle
+
+## Ideia principal
+
+> O pipeline descobre o que precisa reprocessar comparando:
+> 
+> - a última partição já consolidada
+>     
+> - com metadados dos arquivos da Bronze
+>     
+
+---
+
+## Tradução simples
+
+> “Se um arquivo do Bronze mudou depois da última referência consolidada, vale recalcular aquela faixa.”
+
+---
+
+## Tabelas necessárias
+
+### Bronze particionada
+
+```sql
+CREATE EXTERNAL TABLE workspace_db.bronze_pagamentos (
+    contrato_id string,
+    valor double,
+    data_pagamento date
+)
+PARTITIONED BY (data_particao int)
+STORED AS PARQUET
+LOCATION 's3://lakehouse/bronze/cobranca/pagamentos/';
+```
+
+### Silver Iceberg
+
+```sql
+CREATE TABLE workspace_db.silver_pagamentos (
+    contrato_id string,
+    valor double,
+    data_pagamento date,
+    data_particao int,
+    dt_carga timestamp
+)
+WITH (
+    table_type = 'ICEBERG',
+    format = 'PARQUET',
+    partitioning = ARRAY['data_particao'],
+    location = 's3://lakehouse/silver/cobranca/pagamentos/'
+);
+```
+
+---
+
+## Como detectar partições alteradas
+
+### Passo 1 — descobrir última partição da Silver
+
+```sql
+SELECT COALESCE(MAX(data_particao), 0) AS ultima_particao
+FROM workspace_db.silver_pagamentos;
+```
+
+### Passo 2 — comparar com metadados do Bronze
+
+Usando:
+
+- `$file_modified_time`
+    
+
+---
+
+## MERGE incremental completo
+
+```sql
+MERGE INTO workspace_db.silver_pagamentos AS destino
+USING (
+
+    WITH ultima_particao AS (
+        SELECT COALESCE(MAX(data_particao), 0) AS ultima_particao
+        FROM workspace_db.silver_pagamentos
+    ),
+
+    particoes_alteradas AS (
+        SELECT DISTINCT b.data_particao
+        FROM workspace_db.bronze_pagamentos b
+        CROSS JOIN ultima_particao u
+        WHERE b."$file_modified_time" >= CAST(
+            date_parse(CAST(u.ultima_particao AS VARCHAR), '%Y%m%d') AS timestamp
+        )
+    ),
+
+    origem_filtrada AS (
+        SELECT
+            CAST(b.contrato_id AS VARCHAR) AS contrato_id,
+            CAST(b.valor AS DOUBLE) AS valor,
+            TRY_CAST(b.data_pagamento AS DATE) AS data_pagamento,
+            CAST(b.data_particao AS INTEGER) AS data_particao,
+            current_timestamp AS dt_carga
+        FROM workspace_db.bronze_pagamentos b
+        INNER JOIN particoes_alteradas p
+            ON b.data_particao = p.data_particao
+    ),
+
+    origem_deduplicada AS (
+        SELECT *
+        FROM (
+            SELECT
+                contrato_id,
+                valor,
+                data_pagamento,
+                data_particao,
+                dt_carga,
+                ROW_NUMBER() OVER (
+                    PARTITION BY contrato_id, data_pagamento
+                    ORDER BY data_particao DESC
+                ) AS rn
+            FROM origem_filtrada
+            WHERE valor > 0
+              AND contrato_id IS NOT NULL
+              AND data_pagamento IS NOT NULL
+        ) x
+        WHERE rn = 1
+    )
+
+    SELECT
+        contrato_id,
+        valor,
+        data_pagamento,
+        data_particao,
+        dt_carga
+    FROM origem_deduplicada
+
+) AS origem
+
+ON destino.contrato_id = origem.contrato_id
+AND destino.data_pagamento = origem.data_pagamento
+
+WHEN MATCHED THEN
+UPDATE SET
+    valor = origem.valor,
+    data_particao = origem.data_particao,
+    dt_carga = origem.dt_carga
+
+WHEN NOT MATCHED THEN
+INSERT (
+    contrato_id,
+    valor,
+    data_pagamento,
+    data_particao,
+    dt_carga
+)
+VALUES (
+    origem.contrato_id,
+    origem.valor,
+    origem.data_pagamento,
+    origem.data_particao,
+    origem.dt_carga
+);
+```
+
+---
+
+## 🧠 Benefícios
+
+- não precisa tabela auxiliar
+    
+- é dinâmico
+    
+- reduz reprocessamento
+    
+- captura correções retroativas
+    
+- aproveita metadados do próprio lake
+    
+
+---
+
+## ⚠️ Cuidados
+
+### 1. Nem toda alteração de arquivo significa alteração lógica relevante
+
+Às vezes você reprocessa sem necessidade.
+
+### 2. Comparar com “última partição” é útil, mas não resolve tudo
+
+Se houver ajuste muito antigo, talvez essa estratégia não pegue.
+
+
+Ou seja: essa abordagem é elegante, mas não é bala de prata.
+
+---
+
+# 🧱 Passo 7 — Popular Gold
+
+A camada **Gold** é onde os dados ficam prontos para responder pergunta de negócio.
+
+Aqui entram:
+
+- agregações
+    
+- métricas
+    
+- snapshots
+    
+- indicadores
+    
+- tabelas de consumo semântico
+    
+
+Exemplo:
+
+```sql
+INSERT INTO lakehouse.gold_carteira
+SELECT
+    contrato_id,
+    SUM(valor) AS saldo,
+    current_date AS data_snapshot
+FROM lakehouse.silver_pagamentos
+GROUP BY contrato_id;
+```
+
+### O que esse exemplo faz
+
+- consolida pagamentos por contrato
+    
+- calcula `saldo`
+    
+- registra a data do retrato
+    
+
+Em vez de olhar pagamento a pagamento, a Gold já entrega uma visão consolidada.
+
+---
+
+## ⚠️ Observação conceitual importante
+
+Nem toda Gold precisa ser agregada.
+
+Gold pode ser:
+
+- uma tabela de snapshot
+    
+- uma tabela fato
+    
+- uma dimensão tratada
+    
+- uma base semântica
+    
+- uma tabela analítica pronta para BI
+    
+
+No seu contexto, por exemplo, **Gold** pode perfeitamente conter entidades como:
+
+- carteira elegível
+    
+- pagamento consolidado
+    
+- regul
+    
+- caixa
+    
+- atingimento
+    
+- comissão
+    
+
+Ou seja: Gold é mais “camada semântica de negócio” do que apenas “tabela resumida”.
+
+---
+
+# 🧱 Passo 8 — Atualização incremental Gold
+
+Assim como Silver, Gold também não deve ser recriada inteira toda vez.
+
+Exemplo com MERGE:
+
+```sql
+MERGE INTO lakehouse.gold_carteira t
+USING (
+    SELECT
+        contrato_id,
+        SUM(valor) AS saldo
+    FROM lakehouse.silver_pagamentos
+    GROUP BY contrato_id
+) s
+ON t.contrato_id = s.contrato_id
+
+WHEN MATCHED THEN
+UPDATE SET saldo = s.saldo
+
+WHEN NOT MATCHED THEN
+INSERT (contrato_id, saldo)
+VALUES (s.contrato_id, s.saldo);
+```
+
+### O que isso faz
+
+- se o contrato já existe → atualiza
+    
+- se não existe → insere
+    
+
+---
+
+## ⚠️ Em produção, normalmente falta:
+
+- `data_snapshot`
+    
+- controle da janela de atualização
+    
+- chave mais robusta
+    
+- talvez partição temporal
+    
+
+Então esse SQL é ótimo para entender o conceito, mas produção costuma exigir mais cuidado.
+
+---
+
+# 🧱 Passo 9 — Orquestração
+
+Até aqui falamos das tabelas.
+
+Agora entra a parte que faz tudo rodar **na ordem certa**.
+
+Arquitetura típica:
+
+```text
+EventBridge
+    ↓
+Step Functions
+    ↓
+Athena Query / Glue Job
+    ↓
+Atualização das camadas
+```
+
+A documentação do Step Functions descreve workflows como state machines compostas por estados, com integração direta com Athena e Glue
+Ou seja, é como uma receita, em que o bolo só vai para assar no forno quando os ingredientes foram misturados e já estão na forma.
+
+---
+
+## Step Functions Flow
+
+```text
+Start
+ ↓
+Ingest Bronze
+ ↓
+Process Silver
+ ↓
+Update Gold
+ ↓
+Refresh Mart
+ ↓
+End
+```
+
+### Leitura simples
+
+1. entra dado novo
+    
+2. sobe para Bronze
+    
+3. Silver trata
+    
+4. Gold consolida
+    
+5. Mart fica pronto
+    
+6. consumo acontece
+    
+
+---
+
+## Exemplo simples de state machine
+
+```json
+{
+  "StartAt": "MergeSilver",
+  "States": {
+    "MergeSilver": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::athena:startQueryExecution.sync",
+      "Arguments": {
+        "QueryString": "SQL_DO_MERGE",
+        "WorkGroup": "primary",
+        "ResultConfiguration": {
+          "OutputLocation": "s3://lakehouse/ops/results/"
+        }
+      },
+      "Next": "UpdateGold"
+    },
+    "UpdateGold": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::athena:startQueryExecution.sync",
+      "Arguments": {
+        "QueryString": "SQL_GOLD",
+        "WorkGroup": "primary",
+        "ResultConfiguration": {
+          "OutputLocation": "s3://lakehouse/ops/results/"
+        }
+      },
+      "Next": "RefreshMart"
+    },
+    "RefreshMart": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::athena:startQueryExecution.sync",
+      "Arguments": {
+        "QueryString": "SQL_MART",
+        "WorkGroup": "primary",
+        "ResultConfiguration": {
+          "OutputLocation": "s3://lakehouse/ops/results/"
+        }
+      },
+      "End": true
+    }
+  }
+}
+```
+
+O Step Functions suporta integração otimizada com Athena, inclusive no padrão `.sync` para aguardar conclusão da query.
+
+---
+
+## Boas práticas de orquestração
+
+- registrar `id_execucao`
+    
+- salvar logs e resultados técnicos
+    
+- separar erro técnico de erro de qualidade,	ou seja,
+     uma coisa é errar porque não há a tabela a ser consultada (ela foi apagada, por exemplo)
+	Outra coisa é não existir os dados ainda e a informação de pagamento estar defasada;
+    
+- preferir fluxo idempotente
+    
+
+---
+
+# 🧱 Passo 10 — Atualizar Data Mart
+
+A camada **Mart** é a mais próxima do consumo.
+
+Ela costuma ser pensada para:
+
+- dashboard
+    
+- BI
+    
+- relatórios
+    
+- consultas mais simples
+    
+- métricas prontas
+    
+
+Exemplo:
+
+```sql
+CREATE TABLE lakehouse.mart_carteira
+WITH (
+    format = 'PARQUET',
+    external_location = 's3://lakehouse/mart/cobranca/dashboard/'
+)
+AS
+SELECT
+    data_snapshot,
+    SUM(saldo) AS saldo_total
+FROM lakehouse.gold_carteira
+GROUP BY data_snapshot;
+```
+
+### O que isso faz
+
+Entrega uma base mais simples ainda para visualização.
+
+---
+
+# 🧱 Passo 11 — Conectar QuickSight
+
+Depois que o Mart estiver pronto, o consumo no QuickSight fica muito mais simples.
+
+Dataset:
+
+```text
+Athena
+ ↓
+mart_carteira
+```
+
+## Regra importante
+
+> Sempre consumir **mart** ou **gold**.  
+> Nunca **bronze**.
+
+### Por quê?
+
+Porque Bronze:
+
+- ainda está cru
+    
+- pode conter inconsistência
+    
+- não foi desenhado para visualização
+    
+- pode gerar definição de métrica errada
+    
+
+---
+
+# 🧠 Boas práticas importantes
+
+## 1️⃣ Bronze preserva entrada
+
+Não é camada para embelezar dado.
+
+## 2️⃣ Silver padroniza e confere confiança
+
+É onde acontecem:
+
+- deduplicação
+    
+- tipagem
+    
+- validação
+    
+- harmonização
+    
+
+## 3️⃣ Gold modela significado de negócio
+
+É onde entram:
+
+- métricas
+    
+- indicadores
+    
+- snapshots
+    
+- fatos e dimensões de consumo
+    
+
+## 4️⃣ Mart simplifica consumo
+
+É a camada mais amigável para BI. 
+
+## 5️⃣ Grain vem antes do SQL
+
+Antes de codar, responda:
+
+> uma linha representa exatamente o quê?
+
+Sem isso, o lakehouse nasce confuso.
+
+
+## 6️⃣ Conformed dimensions importam
+
+Se várias tabelas analíticas usam “cliente”, “produto”, “data”, “escritório”, essas dimensões precisam conversar entre si.
+
+👉 Ou seja: **mesma definição, mesma chave, mesma regra**
+
+---
+
+### 💥 Problema (sem conformed dimension)
+
+Você tem duas tabelas:
+
+#### 🧱 Fato 1 — pagamentos
+
+fato_pagamentos  
+-------------------------  
+contrato  
+produto  
+cnpj  
+dt_pagamento  
+vl_pago  
+escritorio
+
+---
+
+#### 🧱 Fato 2 — carteira (vigor)
+
+fato_carteira  
+-------------------------  
+contrato  
+produto  
+cnpj_raiz  
+dt_foto  
+vl_saldo  
+escritorio_nome
+
+---
+
+#### 🚨 Problemas clássicos:
+
+- `cnpj` vs `cnpj_raiz`
+- `escritorio` vs `escritorio_nome`
+- regras diferentes de cliente
+- mesma empresa com múltiplas representações
+
+👉 Resultado:
+
+- joins inconsistentes
+- métricas divergentes
+- QuickSight com números diferentes dependendo da tabela
+
+---
+
+### ✅ Solução: Conformed Dimensions
+
+Você cria dimensões padronizadas que **todas as fatos usam**
+
+---
+
+#### 🧩 dim_cliente (conformed)
+
+dim_cliente  
+-------------------------  
+sk_cliente  
+cnpj_completo  
+cnpj_raiz  
+segmento  
+uf  
+dt_inicio_vigencia  
+dt_fim_vigencia  
+fl_ativo
+
+---
+
+#### 🧩 dim_escritorio
+
+dim_escritorio  
+-------------------------  
+sk_escritorio  
+nm_escritorio  
+tipo  
+regional
+
+---
+
+#### 🧩 dim_data
+
+dim_data  
+-------------------------  
+sk_data  
+data  
+ano  
+mes  
+dia_util
+
+---
+
+### 🔗 Agora as fatos ficam assim
+
+#### 🧱 fato_pagamentos
+
+sk_cliente  
+sk_escritorio  
+sk_data  
+vl_pago
+
+---
+
+#### 🧱 fato_carteira
+
+sk_cliente  
+sk_escritorio  
+sk_data  
+vl_saldo
+
+---
+
+### 🎯 O que isso resolve na prática
+
+#### 1. Join confiável
+
+SELECT  
+    d.segmento,  
+    SUM(p.vl_pago) AS total_pago  
+FROM fato_pagamentos p  
+JOIN dim_cliente d  
+    ON p.sk_cliente = d.sk_cliente  
+GROUP BY 1;
+
+👉 Funciona igual em QUALQUER fato
+
+---
+
+#### 2. Métrica consistente
+
+“Cliente PJ” significa a mesma coisa em:
+
+- pagamentos
+- carteira
+- acordos
+- comissionamento
+
+---
+
+#### 3. QuickSight não quebra
+
+Você pode misturar fatos:
+
+- caixa (pagamento)
+- regul (carteira)
+
+👉 sem divergência de dimensão
+
+---
+
+
+
+# 🧠 Particionamento
+
+Muito importante no Athena.
+
+Exemplos de colunas de partição:
+
+```text
+anomes
+anomesdia
+data_particao
+dt_ref
+```
+
+---
+
+### 🎯 Por que isso importa?
+
+Porque o Athena lê **arquivos no S3**, não linhas.
+
+Se a tabela estiver bem particionada:
+
+- lê menos arquivos
+    
+- reduz custo
+    
+- melhora performance
+    
+
+> 💡 Regra de ouro:  
+> você paga pelo que lê
+
+---
+
+## 🔍 1️⃣ Partition Pruning (o mais importante)
+
+### 💡 Ideia simples
+
+> “Se a tabela está particionada por mês, não leia todos os meses — só o necessário”
+
+---
+
+### ❌ Sem pruning
+
+```sql
+SELECT *
+FROM pagamentos
+WHERE valor > 100;
+```
+
+👉 Athena lê **todas as partições**  
+👉 custo alto + lento
+
+---
+
+### ✅ Com pruning
+
+```sql
+SELECT *
+FROM pagamentos
+WHERE mesref = 202601;
+```
+
+👉 Athena lê **só a partição 202601**
+
+---
+
+### 💥 O detalhe crítico
+
+O pruning só acontece se:
+
+- você filtrar **diretamente pela coluna de partição**
+    
+- ou algo que o engine consiga inferir
+    
+
+---
+
+### ⚠️ Anti-pattern clássico
+
+```sql
+WHERE date_format(dt_pagamento, '%Y%m') = '202601'
+```
+
+👉 aqui você matou o pruning
+
+**Por quê?**
+
+- Athena precisa calcular `date_format` linha a linha
+    
+- ele **não consegue mapear isso direto para a partição**
+    
+
+---
+
+### ✅ Forma correta
+
+```sql
+WHERE mesref = 202601
+```
+
+ou
+
+```sql
+WHERE dt_pagamento BETWEEN DATE '2026-01-01' AND DATE '2026-01-31'
+```
+
+_(se a tabela for particionada por data compatível)_
+
+---
+
+## 🚀 2️⃣ Predicate Pushdown
+
+### 💡 Ideia simples
+
+> “Filtrar o máximo possível antes de ler os dados”
+
+---
+
+### 🔎 Onde isso acontece?
+
+#### 🔹 A) Pushdown para arquivos (Parquet)
+
+Parquet possui estatísticas:
+
+- min/max por coluna
+    
+- metadata por bloco
+    
+
+👉 Athena usa isso para **pular blocos inteiros**
+
+---
+
+##### Exemplo
+
+```sql
+WHERE valor > 1000
+```
+
+Se um bloco tem:
+
+```text
+min = 10
+max = 200
+```
+
+👉 esse bloco é ignorado
+
+---
+
+#### 🔹 B) Pushdown com Iceberg (mais poderoso)
+
+Iceberg adiciona uma camada de metadata:
+
+- arquivos organizados por snapshot
+    
+- manifest files
+    
+- estatísticas mais ricas
+    
+
+👉 Athena decide **quais arquivos nem precisam ser lidos**
+
+---
+
+### 🧊 Intuição
+
+```text
+Sem Iceberg:
+S3 → lê arquivos → filtra depois
+
+Com Iceberg:
+Metadata → escolhe arquivos → lê só o necessário
+```
+
+---
+
+## ⚠️ Onde você quebra pushdown/pruning (muito c#omum)
+
+### ❌ 1. Função na coluna de filtro
+
+```sql
+WHERE date(dt_pagamento) = DATE '2026-01-01'
+```
+
+---
+
+### ❌ 2. Cast desnecessário
+
+```sql
+WHERE CAST(mesref AS VARCHAR) = '202601'
+```
+
+---
+
+### ❌ 3. Filtro escondido em subquery/view
+
+```sql
+SELECT *
+FROM (
+    SELECT * FROM pagamentos
+) t
+WHERE mesref = 202601;
+```
+
+👉 pode impedir pushdown
+
+---
+
+### ❌ 4. View que não expõe partição
+
+Se sua view não expõe `mesref`, você perde pruning.
+
+👉 extremamente comum em times
+
+---
+
+## ✅ Boas práticas (nível engenharia)
+
+### 1️⃣ Sempre exponha partições na view
+
+```sql
+SELECT
+    mesref,
+    contrato,
+    valor
+FROM base;
+```
+
+---
+
+### 2️⃣ Sempre filtre cedo
+
+```sql
+WITH base AS (
+    SELECT *
+    FROM pagamentos
+    WHERE mesref = 202601
+)
+```
+
+---
+
+### 3️⃣ Evite funções no WHERE
+
+
+---
+
+## 🧪 Exemplos práticos
+
+### ✅ Query boa (otimizada)
+
+```sql
+WHERE dt_foto = 20260101
+```
+
+---
+
+### ❌ Query ruim (cara)
+
+```sql
+WHERE date_format(parse_datetime(dt_foto, 'yyyyMMdd'), '%Y%m') = '202601'
+```
+
+---
+
+## ⚠️ Observação prática
+
+Particionar mal também dói.
+
+---
+
+### 🚨 Problemas comuns
+
+- granularidade fina demais  
+    👉 ex: particionar por contrato (explosão de partições)
+    
+- milhões de arquivos pequenos
+    
+- chave de partição pouco usada em filtro
+    
+- partição escondida (ninguém sabe que existe)
+
+
+
+
+
+
+# 🧠 Tamanho de arquivos
+
+Boa referência prática:
+
+```text
+128MB – 512MB
+```
+
+Por quê?
+
+- muitos arquivos pequenos pioram leitura
+    
+- excesso de pequenos arquivos degrada desempenho
+    
+- manutenção fica mais difícil
+    
+
+Spark e práticas modernas de data engineering tratam bastante desse ponto.
+
+---
+
+# 🧠 Metadados e governança
+
+Usar:
+
+```text
+Glue Catalog
+```
+
+Para:
+
+```text
+schema
+localização
+acesso
+catálogo
+descoberta
+linhagem parcial
+```
+
+## Em termos simples
+
+Metadado é o “dado sobre o dado”.
+
+Exemplos:
+
+```text
+- nome da tabela
+    
+- nome da coluna
+    
+- tipo da coluna
+    
+- partição
+    
+- onde o dado mora
+    
+- quando foi atualizado
+    
+- qual processo escreveu
+    
+
+Sem metadado bom:
+
+- ninguém acha nada
+    
+- ninguém confia
+    
+- tudo vira “tabela misteriosa”
+    
+```
+
+No lakehouse, governança não é luxo. É o que impede o ambiente de virar um depósito de arquivos sem contexto.
+
+---
+
+# 🧱 SCD2 (histórico de mudanças) com incremental por partição
+
+Relacionado a: [[SCD2]]
+
+---
+
+## Problema
+
+> Se você só faz `UPDATE`, você perde o histórico.
+
+---
+
+## Exemplo prático
+
+Situação inicial:
+
+```text
+id_cliente = 100
+segmento = Empreenda
+```
+
+Depois:
+
+```text
+id_cliente = 100
+segmento = Top
+```
+
+Se fizer só:
+
+```sql
+UPDATE tabela SET segmento = 'Top'
+```
+
+Você apaga o passado.
+
+---
+
+## Com SCD2
+
+|id_cliente|segmento|dt_inicio_vigencia|dt_fim_vigencia|fl_ativo|
+|---|---|---|---|---|
+|100|Empreenda|2024-01-01|2024-01-19|false|
+|100|Top|2024-01-20|9999-12-31|true|
+
+Essa lógica bate com o conceito clássico de **Type 2: add new row**, tratado por Kimball.
+
+---
+
+## Estrutura da tabela
+
+```sql
+CREATE TABLE workspace_db.gold_cliente_segmentacao_scd2 (
+    id_cliente string,
+    segmento string,
+    dt_inicio_vigencia date,
+    dt_fim_vigencia date,
+    fl_ativo boolean,
+    data_particao int,
+    dt_carga timestamp
+)
+WITH (
+    table_type = 'ICEBERG',
+    format = 'PARQUET',
+    partitioning = ARRAY['data_particao'],
+    location = 's3://lakehouse/gold/cobranca/cliente_segmentacao_scd2/'
+);
+```
+
+---
+
+## Regra incremental
+
+> O SCD2 não precisa olhar o histórico inteiro sempre.  
+> Ele deve olhar o trecho que pode ter mudado.
+
+---
+
+## Passo 1 — descobrir última partição
+
+```sql
+SELECT COALESCE(MAX(data_particao), 0) AS ultima_particao
+FROM workspace_db.gold_cliente_segmentacao_scd2;
+```
+
+---
+
+## Passo 2 — filtrar origem incremental
+
+```sql
+WITH ultima_particao AS (
+    SELECT COALESCE(MAX(data_particao), 0) AS ultima_particao
+    FROM workspace_db.gold_cliente_segmentacao_scd2
+),
+
+origem_incremental AS (
+    SELECT
+        id_cliente,
+        segmento,
+        data_particao,
+        current_date AS dt_inicio_vigencia,
+        current_timestamp AS dt_carga
+    FROM workspace_db.silver_cliente_segmentacao s
+    CROSS JOIN ultima_particao u
+    WHERE s.data_particao >= u.ultima_particao
+)
+```
+
+---
+
+## Passo 3 — comparar com o registro ativo
+
+```sql
+, comparacao AS (
+    SELECT
+        o.id_cliente,
+        o.segmento AS segmento_novo,
+        t.segmento AS segmento_atual,
+        o.data_particao,
+        o.dt_inicio_vigencia,
+        o.dt_carga
+    FROM origem_incremental o
+    LEFT JOIN workspace_db.gold_cliente_segmentacao_scd2 t
+        ON o.id_cliente = t.id_cliente
+       AND t.fl_ativo = true
+)
+```
+
+---
+
+## Passo 4 — aplicar SCD2 com MERGE
+
+### ⚠️ Observação importante
+
+A forma mais segura e legível de implementar SCD2 no Athena nem sempre é um único `MERGE` “mágico”. Muitas vezes fica mais robusto fazer em **duas etapas**:
+
+1. fechar registros ativos que mudaram
+    
+2. inserir nova versão
+    
+
+Isso costuma ser mais claro e menos sujeito a bug lógico.
+
+---
+
+## Opção didática e robusta: duas etapas
+
+### Etapa A — fechar o registro ativo anterior
+
+```sql
+MERGE INTO workspace_db.gold_cliente_segmentacao_scd2 AS destino
+USING (
+    WITH ultima_particao AS (
+        SELECT COALESCE(MAX(data_particao), 0) AS ultima_particao
+        FROM workspace_db.gold_cliente_segmentacao_scd2
+    ),
+    origem_incremental AS (
+        SELECT
+            id_cliente,
+            segmento,
+            data_particao,
+            current_date AS dt_inicio_vigencia
+        FROM workspace_db.silver_cliente_segmentacao s
+        CROSS JOIN ultima_particao u
+        WHERE s.data_particao >= u.ultima_particao
+    )
+    SELECT
+        o.id_cliente,
+        o.segmento,
+        o.data_particao,
+        o.dt_inicio_vigencia
+    FROM origem_incremental o
+    INNER JOIN workspace_db.gold_cliente_segmentacao_scd2 t
+        ON o.id_cliente = t.id_cliente
+       AND t.fl_ativo = true
+    WHERE o.segmento <> t.segmento
+) AS origem
+ON destino.id_cliente = origem.id_cliente
+AND destino.fl_ativo = true
+
+WHEN MATCHED THEN
+UPDATE SET
+    dt_fim_vigencia = origem.dt_inicio_vigencia - INTERVAL '1' DAY,
+    fl_ativo = false;
+```
+
+### Etapa B — inserir a nova versão
+
+```sql
+INSERT INTO workspace_db.gold_cliente_segmentacao_scd2 (
+    id_cliente,
+    segmento,
+    dt_inicio_vigencia,
+    dt_fim_vigencia,
+    fl_ativo,
+    data_particao,
+    dt_carga
+)
+WITH ultima_particao AS (
+    SELECT COALESCE(MAX(data_particao), 0) AS ultima_particao
+    FROM workspace_db.gold_cliente_segmentacao_scd2
+),
+origem_incremental AS (
+    SELECT
+        id_cliente,
+        segmento,
+        data_particao,
+        current_date AS dt_inicio_vigencia,
+        current_timestamp AS dt_carga
+    FROM workspace_db.silver_cliente_segmentacao s
+    CROSS JOIN ultima_particao u
+    WHERE s.data_particao >= u.ultima_particao
+),
+comparacao AS (
+    SELECT
+        o.id_cliente,
+        o.segmento AS segmento_novo,
+        t.segmento AS segmento_atual,
+        o.data_particao,
+        o.dt_inicio_vigencia,
+        o.dt_carga
+    FROM origem_incremental o
+    LEFT JOIN workspace_db.gold_cliente_segmentacao_scd2 t
+        ON o.id_cliente = t.id_cliente
+       AND t.fl_ativo = true
+)
+SELECT
+    id_cliente,
+    segmento_novo AS segmento,
+    dt_inicio_vigencia,
+    DATE '9999-12-31' AS dt_fim_vigencia,
+    true AS fl_ativo,
+    data_particao,
+    dt_carga
+FROM comparacao
+WHERE segmento_atual IS NULL
+   OR segmento_novo <> segmento_atual;
+```
+
+---
+
+## Fluxo mental completo
+
+```text
+Descobre última partição
+ ↓
+Filtra origem (>= última partição)
+ ↓
+Compara com registro ativo
+ ↓
+Se mudou:
+    fecha o antigo
+    insere o novo
+Se não mudou:
+    não faz nada
+```
+
+---
+
+## Benefícios
+
+- evita reprocessar tudo
+    
+- mantém histórico temporal
+    
+- funciona bem com Iceberg
+    
+- reduz custo
+    
+- captura correção retroativa recente
+    
+
+---
+
+## ⚠️ Cuidados importantes
+
+### 1. Janela pode ser pequena demais
+
+Se o dado chega muito atrasado, usar só `>= ultima_particao` pode não bastar.
+
+Às vezes é melhor:
+
+```text
+>= ultima_particao - N dias
+```
+
+### 2. SCD2 exige chave de negócio bem definida
+
+Exemplo:
+
+```text
+id_cliente
+```
+
+Mas talvez o negócio real seja:
+
+```text
+id_cliente + tipo_relacao
+```
+
+### 3. SCD2 não substitui boa modelagem
+
+Antes de criar histórico, confirme:
+
+- esse atributo realmente precisa de histórico?
+    
+- quem vai usar?
+    
+- qual pergunta de negócio isso responde?
+    
+
+Nem todo atributo merece SCD2.
+
+---
+
+# 🧠 Modelagem dimensional dentro do lakehouse
+
+O padrão medallion **não substitui** modelagem dimensional.
+
+Na prática:
+
+- Bronze organiza entrada
+    
+- Silver estrutura confiança
+    
+- Gold pode conter **fatos**, **dimensões**, **snapshots**, **métricas**
+    
+
+Então uma combinação saudável pode ser:
+
+```text
+Bronze = ingestão e preservação
+Silver = normalização / integração / padronização
+Gold = modelo analítico e semântico
+Mart = consumo final
+```
+
+E dentro da Gold você pode ter:
+
+- fato transacional
+    
+- snapshot periódico
+    
+- snapshot acumulado
+    
+- dimensão SCD2
+    
+
+---
+
+# 🧠 Estrutura ideal final
+
+```text
+lakehouse/
+
+bronze/
+silver/
+gold/
+mart/
+
+catalog/
+orchestration/
+monitoring/
+auditoria/
+```
+
+Essa separação ajuda a mostrar que o lakehouse não é só tabela.
+
+Ele também precisa de:
+
+- catálogo
+    
+- orquestração
+    
+- monitoramento
+    
+- auditoria
+    
+- governança
+    
+
+---
+
+# 🚀 Arquitetura madura
+
+```text
+S3
++
+Iceberg
++
+Glue Catalog
++
+Athena
++
+Step Functions
++
+EventBridge
+```
+
+Isso forma um **lakehouse serverless** bem coerente para analytics.
+
+Em termos simples, você junta:
+
+- storage escalável
+    
+- tabela moderna
+    
+- catálogo central
+    
+- SQL serverless
+    
+- automação
+    
+- agendamento
+    
+
+Resultado:
+
+> uma arquitetura moderna, modular e relativamente simples de operar para uso analítico.
+
+---
+
+# 🧠 Regra final
+
+> Lakehouse não é só jogar arquivo no S3 e consultar com Athena.
+
+Lakehouse de verdade envolve:
+
+- organização em camadas
+    
+- metadados
+    
+- padrão de ingestão
+    
+- incremental confiável
+    
+- histórico quando necessário
+    
+- modelo de consumo claro
+    
+- governança
+    
+- orquestração
+    
+
+---
+
+# 📌 Resumo executivo
+
+- **Bronze** preserva entrada
+    
+- **Silver** padroniza e confere confiança
+    
+- **Gold** representa negócio
+    
+- **Mart** simplifica consumo
+    
+- **Glue Catalog** guarda metadados
+    
+- **Iceberg** habilita MERGE, ACID e incremental robusto
+    
+- **Athena** processa com SQL direto no S3
+    
+- **Step Functions** organiza a execução
+    
+- **EventBridge** agenda e dispara
+    
+- **SCD2** entra quando você precisa preservar histórico de atributo
+    
+- **grain, chave e partição** são decisões centrais, não detalhes
+    
