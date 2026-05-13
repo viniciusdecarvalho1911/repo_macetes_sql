@@ -1,0 +1,495 @@
+Vintage analysis é uma técnica extremamente usada em:
+
+crédito
+
+cobrança
+
+risco
+
+inadimplência
+
+cohort analysis
+
+comportamento de carteira
+
+recuperação
+
+conversão
+
+
+Ela responde perguntas como:
+
+“Como cada safra performa ao longo do tempo?”
+
+“As carteiras novas estão melhores ou piores?”
+
+“Qual geração de contratos virou inadimplente mais rápido?”
+
+“Qual safra recupera mais rápido?”
+
+“O comportamento muda conforme a idade da safra?”
+
+
+
+---
+
+🧠 Ideia intuitiva
+
+Pense assim:
+
+Vintage = safra/coorte
+
+Você agrupa elementos que nasceram juntos.
+
+Exemplo:
+
+Contrato	Data entrada atraso
+
+A	Jan/2026
+B	Jan/2026
+C	Fev/2026
+D	Mar/2026
+
+
+Agora você acompanha:
+
+o que aconteceu com cada safra ao longo do tempo
+
+
+---
+
+📦 Exemplo simples — cobrança
+
+Imagine:
+
+Safra = mês em que o contrato entrou em atraso
+
+Você quer saber:
+
+quanto cada safra recuperou ao longo dos meses
+
+
+---
+
+📊 Tabela exemplo
+
+Entrada
+
+Contrato	Safra	Valor
+
+A	2026-01	1000
+B	2026-01	2000
+C	2026-02	1500
+D	2026-02	3000
+
+
+
+---
+
+Recuperação ao longo do tempo
+
+Safra	M0	M1	M2	M3
+
+2026-01	10%	25%	40%	55%
+2026-02	8%	20%	35%	50%
+
+
+Onde:
+
+M0 = mês de entrada
+
+M1 = 1 mês depois
+
+M2 = 2 meses depois
+
+
+
+---
+
+🎯 O que isso mostra?
+
+Exemplo de insight
+
+A safra de Jan/2026:
+
+recuperou mais rápido
+
+converteu melhor
+
+amadureceu mais rápido
+
+
+Já Fev/2026:
+
+teve pior recuperação inicial
+
+
+Isso pode indicar:
+
+carteira pior
+
+estratégia pior
+
+escritório pior
+
+mudança operacional
+
+sazonalidade
+
+
+
+---
+
+🧱 Vintage analysis em cobrança
+
+No seu contexto, isso é MUITO poderoso.
+
+Você pode fazer vintages de:
+
+Vintage de	Acompanhamento
+
+entrada em atraso	cura
+emissão de boleto	pagamento
+distribuição para escritório	regularização
+ajuizamento	recuperação jurídica
+entrada em carteira	retroação
+negociação	quebra/acordo pago
+
+
+
+---
+
+💡 Exemplo real do seu cenário
+
+Você já pensa muito em:
+
+EMISSÃO → CONVERSÃO → REGUL
+
+Vintage analysis encaixa perfeitamente aqui.
+
+
+---
+
+📌 Exemplo — safra de emissão
+
+Pergunta
+
+boletos emitidos em cada semana convertem em quanto tempo?
+
+
+---
+
+Tabela
+
+Safra emissão	D0	D7	D15	D30
+
+2026-05-01	5%	18%	30%	45%
+2026-05-08	4%	15%	25%	40%
+
+
+Agora você consegue responder:
+
+qual safra converte melhor?
+
+qual demora mais?
+
+o delay aumentou?
+
+o problema está na emissão ou cobrança?
+
+
+Isso conversa diretamente com o framework de projeção por safra que você vem construindo. 
+
+
+---
+
+🧠 Modelo mental correto
+
+Vintage analysis NÃO olha só o total.
+
+Ele olha:
+
+comportamento ao longo do tempo
+
+É quase uma:
+
+curva de envelhecimento/comportamento
+
+
+---
+
+📈 Exemplo visual mental
+
+Imagine duas curvas:
+
+Safra Jan:
+███▇▇▇▆▆▆
+
+Safra Fev:
+██▅▅▅▄▄▄
+
+Você imediatamente percebe:
+
+Jan performa melhor
+
+Fev deteriorou
+
+
+
+---
+
+🔥 Aplicações extremamente fortes
+
+1️⃣ Cobrança
+
+curva de cura
+
+tempo até pagamento
+
+aging
+
+retroação
+
+quebra de acordo
+
+
+
+---
+
+2️⃣ Crédito
+
+inadimplência por safra
+
+default cumulativo
+
+roll rate
+
+
+
+---
+
+3️⃣ Produto digital
+
+retenção de usuários
+
+cohort de signup
+
+
+
+---
+
+4️⃣ Jurídico
+
+recuperação por safra de ajuizamento
+
+aging processual
+
+
+
+---
+
+🧩 Como modelar isso dimensionalmente
+
+Kimball separa muito bem fatos com timings diferentes. 
+
+Vintage analysis normalmente gera:
+
+Fato de origem
+
+Exemplo:
+
+1 linha = 1 contrato no momento da entrada
+
+
+---
+
+Fato evolutivo
+
+Exemplo:
+
+1 linha = 1 safra + 1 idade da safra
+
+
+---
+
+🏗️ Exemplo de modelagem
+
+Fato base
+
+iceberg_gold_fato_cobranca_safra
+
+Grão:
+
+1 linha = 1 contrato + data entrada atraso
+
+
+---
+
+Mart vintage
+
+iceberg_gold_mart_cobranca_vintage
+
+Grão:
+
+1 linha = 1 safra + idade_safra
+
+Isso fica totalmente alinhado com sua arquitetura medallion e separação bronze → silver → gold.
+
+
+---
+
+📊 Exemplo físico no Athena
+
+Base
+
+contrato	dt_entrada	dt_pagamento	vl
+
+1	2026-01-05	2026-01-20	1000
+2	2026-01-08	2026-02-15	2000
+
+
+
+---
+
+SQL de idade da safra
+
+SELECT
+    date_trunc('month', dt_entrada) AS safra,
+
+    date_diff(
+        'month',
+        date_trunc('month', dt_entrada),
+        date_trunc('month', dt_pagamento)
+    ) AS idade_safra,
+
+    sum(vl) AS vl_pago
+FROM fato_pagamentos
+GROUP BY 1,2
+
+
+---
+
+📌 Resultado
+
+Safra	Idade	Pago
+
+2026-01	0	1000
+2026-01	1	2000
+
+
+
+---
+
+🧠 O insight poderoso
+
+Você transforma tempo em eixo analítico.
+
+Ao invés de:
+
+quanto pagou em fevereiro?
+
+você passa a perguntar:
+
+quanto a safra de janeiro já maturou?
+
+Isso é MUITO mais poderoso para:
+
+previsão
+
+comparação
+
+comportamento
+
+eficiência operacional
+
+benchmark
+
+
+
+---
+
+🔥 No seu caso específico
+
+Vintage analysis encaixa absurdamente bem em:
+
+📌 Retroação
+
+quanto tempo contratos envelhecem antes de retroagir?
+
+
+---
+
+📌 Cura
+
+qual safra cura mais rápido?
+
+
+---
+
+📌 Escritórios
+
+qual escritório acelera mais a curva de recuperação?
+
+
+---
+
+📌 Boletos
+
+qual safra de emissão converte melhor?
+
+
+---
+
+📌 Share operacional
+
+qual parceiro performa melhor em safra jovem vs velha?
+
+
+---
+
+🚨 Erro MUITO comum
+
+Misturar:
+
+tempo calendário
+
+com
+
+idade da safra
+
+Vintage analysis quase sempre deve usar:
+
+idade relativa
+
+e não data absoluta.
+
+
+---
+
+🧠 Relação com cohort analysis
+
+Na prática:
+
+Vintage analysis = cohort analysis financeira
+
+São quase irmãos conceituais.
+
+
+---
+
+📚 O que os materiais cobrem
+
+Kimball cobre:
+
+fatos por processo
+
+snapshots
+
+accumulating snapshots
+
+modelagem temporal 
+
+
+O livro de Medallion mostra como organizar isso em pipelines modernos lakehouse.
+
+Seu framework de projeção e safra já está MUITO próximo de um motor completo de vintage analysis operacional. 
